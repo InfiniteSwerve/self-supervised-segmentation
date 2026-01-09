@@ -11,7 +11,6 @@ from torch.optim import Optimizer
 import torch.nn.functional as F
 from torch.amp.grad_scaler import GradScaler
 import numpy as np
-import einops
 from spectralis_dataset import SpectralisLoader
 import matplotlib.pyplot as plt
 import time
@@ -21,6 +20,7 @@ from torch import Tensor
 from dataclasses import dataclass
 from typing import Optional
 import os
+import shutil
 
 from octcube import OCTCubeSegmenter
 
@@ -46,7 +46,9 @@ class TrainConfig:
     num_classes: int = 12
 
     # Paths
-    checkpoint_path: Optional[str] = None  # Path to OCTCube pretrained weights
+    checkpoint_path: Optional[str] = None  # Path to OCTCube pretrained encoder weights
+    save_dir: str = "checkpoints_octcube"
+    resume_from: Optional[str] = None  # Path to resume training from (latest checkpoint)
 
 
 class Metrics:
@@ -156,6 +158,65 @@ class Metrics:
     def should_calc_dice(self):
         return self.current_iter % TrainConfig.dice_calc_interval == 0
 
+    def get_latest_val_dice(self) -> Optional[float]:
+        """Get the most recent validation dice_mean score."""
+        dice_vals = self.data["val"]["metrics"].get("dice_mean", [])
+        if dice_vals:
+            return dice_vals[-1]
+        return None
+
+
+def save_checkpoint(model, optimizer, scaler, metrics, path, is_best=False):
+    """Save training checkpoint."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    checkpoint = {
+        "head_state_dict": model.head.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "metrics": {
+            "current_iter": metrics.current_iter,
+            "current_epoch": metrics.current_epoch,
+            "data": {
+                split: {
+                    "iterations": metrics.data[split]["iterations"],
+                    "metrics": dict(metrics.data[split]["metrics"]),
+                }
+                for split in metrics.data
+            },
+        },
+        "is_best": is_best,
+    }
+    torch.save(checkpoint, path)
+    print(f"Saved checkpoint to {path}")
+
+
+def load_checkpoint(model, optimizer, scaler, metrics, path):
+    """Load training checkpoint."""
+    from collections import defaultdict
+
+    if not os.path.exists(path):
+        print(f"No checkpoint found at {path}")
+        return False
+
+    checkpoint = torch.load(path, map_location="cuda", weights_only=False)
+
+    model.head.load_state_dict(checkpoint["head_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+    # Restore metrics
+    metrics_data = checkpoint["metrics"]
+    metrics.current_iter = metrics_data["current_iter"]
+    metrics.current_epoch = metrics_data["current_epoch"]
+    for split in metrics_data["data"]:
+        metrics.data[split]["iterations"] = metrics_data["data"][split]["iterations"]
+        metrics.data[split]["metrics"] = defaultdict(
+            list, metrics_data["data"][split]["metrics"]
+        )
+
+    print(f"Loaded checkpoint from {path} (epoch {metrics.current_epoch}, iter {metrics.current_iter})")
+    return True
+
 
 @typechecked
 def heightmap_to_volume(
@@ -224,9 +285,9 @@ def supervised_epoch(
 
         # Load volume data
         # frames: (C, S, H, W) -> (S, C, H, W)
-        ims = einops.rearrange(batch["frames"], "c s h w -> s c h w").cuda()
-        # label: (C, L, S, W) -> (S, L, W)
-        height = einops.rearrange(batch["label"], "c l s w -> s l w").cuda()
+        ims = batch["frames"].permute(1, 0, 2, 3).cuda()
+        # label: (C, L, S, W) -> (S, L, W) - index into C dim since C=1
+        height = batch["label"][0].permute(1, 0, 2).cuda()
 
         S, C, H, W = ims.shape
         print(f"Volume loaded: {S} slices, {H}x{W}, time: {time.monotonic() - st:.2f}s")
@@ -338,8 +399,8 @@ def validation_epoch(model, dataloader, metrics: Metrics, split):
 
     with torch.no_grad():
         for batch in dataloader:
-            ims = einops.rearrange(batch["frames"], "c s h w -> s c h w").cuda()
-            height = einops.rearrange(batch["label"], "c l s w -> s l w").cuda()
+            ims = batch["frames"].permute(1, 0, 2, 3).cuda()
+            height = batch["label"][0].permute(1, 0, 2).cuda()
             S, C, H, W = ims.shape
 
             for run in range(0, S, TrainConfig.step_size):
@@ -393,8 +454,8 @@ def validation_partial_epoch(model, dataloader, metrics: Metrics, split):
             if vol_idx >= max_vols:
                 break
 
-            ims = einops.rearrange(batch["frames"], "c s h w -> s c h w").cuda()
-            height = einops.rearrange(batch["label"], "c l s w -> s l w").cuda()
+            ims = batch["frames"].permute(1, 0, 2, 3).cuda()
+            height = batch["label"][0].permute(1, 0, 2).cuda()
             S, C, H, W = ims.shape
 
             # Just process first chunk for speed
@@ -505,6 +566,7 @@ def save_reconstruction_segmentation(images, gt_boundaries, logits, fname):
 def full_supervised_run():
     """Main training function."""
     os.makedirs("selected_images", exist_ok=True)
+    os.makedirs(TrainConfig.save_dir, exist_ok=True)
 
     train_loader = torch.utils.data.DataLoader(
         SpectralisLoader(
@@ -557,7 +619,25 @@ def full_supervised_run():
     metrics = Metrics()
     print("Initialized Metrics")
 
-    for e in range(1, TrainConfig.epochs + 1):
+    # Track best validation performance
+    best_val_dice = 0.0
+
+    # Resume from checkpoint if specified
+    start_epoch = 1
+    if TrainConfig.resume_from is not None:
+        if load_checkpoint(model, optimizer, scaler, metrics, TrainConfig.resume_from):
+            start_epoch = metrics.current_epoch + 1
+            # Load best dice from best checkpoint if it exists
+            best_path = os.path.join(TrainConfig.save_dir, "best.pt")
+            if os.path.exists(best_path):
+                best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+                best_val_dice = best_ckpt["metrics"]["data"]["val"]["metrics"].get("dice_mean", [0])[-1]
+                print(f"Best validation dice so far: {best_val_dice:.4f}")
+
+    latest_path = os.path.join(TrainConfig.save_dir, "latest.pt")
+    best_path = os.path.join(TrainConfig.save_dir, "best.pt")
+
+    for e in range(start_epoch, TrainConfig.epochs + 1):
         metrics.current_epoch = e
         print(f"Epoch: {e}")
         supervised_epoch(
@@ -572,8 +652,23 @@ def full_supervised_run():
         print("validation")
         validation_epoch(model, val_loader, metrics, "val")
 
+        # Get current validation dice
+        current_val_dice = metrics.get_latest_val_dice()
+
+        # Save latest checkpoint
+        save_checkpoint(model, optimizer, scaler, metrics, latest_path)
+
+        # Save best checkpoint if this is the best so far
+        if current_val_dice is not None and current_val_dice > best_val_dice:
+            best_val_dice = current_val_dice
+            save_checkpoint(model, optimizer, scaler, metrics, best_path, is_best=True)
+            print(f"New best validation dice: {best_val_dice:.4f}")
+
     print("testing")
     validation_epoch(model, test_loader, metrics, "test")
+
+    # Save final metrics
+    metrics.save(os.path.join(TrainConfig.save_dir, "metrics_final.json"))
 
 
 if __name__ == "__main__":
