@@ -3,10 +3,6 @@ Training script for OCTCube-based segmentation.
 
 This script adapts the MIRAGE training pipeline to work with OCTCube,
 which processes 3D OCT volumes instead of individual slices.
-
-Two training modes are supported:
-1. Volume mode: Process entire volumes at once (memory intensive)
-2. Sliding window mode: Process windows of slices with temporal context
 """
 
 import torch
@@ -23,11 +19,10 @@ from jaxtyping import Float, jaxtyped
 from beartype import beartype
 from torch import Tensor
 from dataclasses import dataclass
-from typing import Optional, Tuple
-import argparse
+from typing import Optional
 import os
 
-from octcube import OCTCubeSegmenter, OCTCubeSliceSegmenter
+from octcube import OCTCubeSegmenter
 
 typechecked = jaxtyped(typechecker=beartype)
 
@@ -35,8 +30,7 @@ typechecked = jaxtyped(typechecker=beartype)
 @dataclass
 class TrainConfig:
     # Training parameters
-    step_size: int = 48  # Number of slices to process at once (should match num_frames)
-    context_window: int = 5  # Context slices on each side for sliding window mode
+    step_size: int = 48  # Number of slices per volume chunk (must be divisible by t_patch_size=3)
     partial_val_interval: int = 500
     train_save_im: int = 300
     plot_losses: int = 300
@@ -44,17 +38,15 @@ class TrainConfig:
     dice_calc_interval: int = 50
 
     # Model parameters
-    img_size: int = 224
+    img_size: int = 512
     patch_size: int = 16
     num_frames: int = 48
+    t_patch_size: int = 3
     model_size: str = 'large'
-
-    # Training mode: 'volume' or 'sliding_window'
-    mode: str = 'sliding_window'
+    num_classes: int = 12
 
     # Paths
-    checkpoint_path: Optional[str] = None
-    save_dir: str = 'checkpoints_octcube'
+    checkpoint_path: Optional[str] = None  # Path to OCTCube pretrained weights
 
 
 class Metrics:
@@ -216,336 +208,113 @@ def compute_dice_scores(
     return dice_scores
 
 
-@typechecked
-def compute_dice_scores_volume(
-    gt_boundaries: Float[Tensor, "batch slices layers width"],
-    pred_vol: Float[Tensor, "batch slices num_classes height width"],
-) -> dict[str, float]:
-    """Compute dice scores for 3D volume predictions."""
-    B, T, num_classes, H, W = pred_vol.shape
-
-    # Flatten batch and time dimensions
-    pred_flat = pred_vol.argmax(2).reshape(B * T, H, W)
-
-    # Convert boundaries to masks for each slice
-    gt_flat = []
-    for b in range(B):
-        for t in range(T):
-            gt_mask = heightmap_to_volume(
-                gt_boundaries[b, t:t+1], (H, W)
-            )
-            gt_flat.append(gt_mask)
-    gt_flat = torch.cat(gt_flat, dim=0)
-
-    # One-hot encode
-    pred_oh = F.one_hot(pred_flat, num_classes).permute(0, 3, 1, 2).float()
-    gt_oh = F.one_hot(gt_flat, num_classes).permute(0, 3, 1, 2).float()
-
-    intersection = (pred_oh * gt_oh).sum(dim=(0, 2, 3))
-    union = pred_oh.sum(dim=(0, 2, 3)) + gt_oh.sum(dim=(0, 2, 3))
-
-    dice = torch.where(union > 0, 2 * intersection / union, torch.ones_like(union))
-
-    dice_scores = {f"dice_L{c}": dice[c].item() for c in range(num_classes)}
-    dice_scores["dice_mean"] = dice.mean().item()
-    return dice_scores
-
-
-def resize_volume(images: Tensor, target_size: Tuple[int, int]) -> Tensor:
-    """Resize a volume of images to target size."""
-    B, T, C, H, W = images.shape
-    if (H, W) == target_size:
-        return images
-
-    # Reshape for batch processing
-    images = images.reshape(B * T, C, H, W)
-    images = F.interpolate(images, size=target_size, mode='bilinear', align_corners=False)
-    images = images.reshape(B, T, C, *target_size)
-    return images
-
-
-def resize_boundaries(boundaries: Tensor, original_size: Tuple[int, int], target_size: Tuple[int, int]) -> Tensor:
-    """Resize boundary heightmaps to match target image size."""
-    if original_size == target_size:
-        return boundaries
-
-    B, T, K, W = boundaries.shape
-    scale_h = target_size[0] / original_size[0]
-    scale_w = target_size[1] / original_size[1]
-
-    # Scale boundary positions
-    boundaries = boundaries * scale_h  # Scale heights
-
-    # Resize width dimension
-    boundaries = boundaries.reshape(B * T, K, W)
-    boundaries = F.interpolate(
-        boundaries.unsqueeze(1),
-        size=(K, target_size[1]),
-        mode='bilinear',
-        align_corners=False
-    ).squeeze(1)
-    boundaries = boundaries.reshape(B, T, K, target_size[1])
-
-    return boundaries
-
-
-########################################################################
-# Volume-mode training (process entire volume at once)
-
-
-def volume_supervised_epoch(
-    model: nn.Module,
-    optimizer: Optimizer,
-    scaler: GradScaler,
+def supervised_epoch(
+    model,
+    optimizer,
+    scaler,
     train_dataloader,
     val_dataloader,
     metrics: Metrics,
-    config: TrainConfig,
 ):
-    """Training epoch for volume mode."""
+    """Training epoch - processes volumes in chunks."""
     model.train()
 
     for batch in train_dataloader:
         st = time.monotonic()
 
-        # Load volume: (C, S, H, W) -> (1, S, C, H, W)
-        ims = batch["frames"].permute(0, 1, 2, 3).unsqueeze(0).cuda()  # (1, S, C, H, W)
-        # Boundaries: (C, L, S, W) -> (1, S, L, W)
-        height = batch["label"].permute(2, 0, 1, 3).unsqueeze(0).cuda()
+        # Load volume data
+        # frames: (C, S, H, W) -> (S, C, H, W)
+        ims = einops.rearrange(batch["frames"], "c s h w -> s c h w").cuda()
+        # label: (C, L, S, W) -> (S, L, W)
+        height = einops.rearrange(batch["label"], "c l s w -> s l w").cuda()
 
-        B, S, C, H, W = ims.shape
+        S, C, H, W = ims.shape
+        print(f"Volume loaded: {S} slices, {H}x{W}, time: {time.monotonic() - st:.2f}s")
 
-        # Resize if needed
-        if H != config.img_size or W != config.img_size:
-            ims = resize_volume(ims, (config.img_size, config.img_size))
-            height = resize_boundaries(height, (H, W), (config.img_size, config.img_size))
+        # Process in chunks of step_size slices
+        for run in range(0, S, TrainConfig.step_size):
+            end_idx = min(run + TrainConfig.step_size, S)
+            chunk_size = end_idx - run
 
-        print(f"Data loading: {time.monotonic() - st:.2f}s")
-
-        # Process in chunks of num_frames
-        for start_idx in range(0, S, config.step_size):
-            end_idx = min(start_idx + config.step_size, S)
-            chunk_ims = ims[:, start_idx:end_idx]
-            chunk_height = height[:, start_idx:end_idx]
-
+            # Need chunk_size divisible by t_patch_size for OCTCube
             # Pad if necessary
-            actual_frames = end_idx - start_idx
-            if actual_frames < config.num_frames:
-                pad_size = config.num_frames - actual_frames
-                chunk_ims = F.pad(chunk_ims, (0, 0, 0, 0, 0, 0, 0, pad_size), mode='replicate')
-                chunk_height = F.pad(chunk_height, (0, 0, 0, 0, 0, pad_size), mode='replicate')
+            if chunk_size % TrainConfig.t_patch_size != 0:
+                pad_size = TrainConfig.t_patch_size - (chunk_size % TrainConfig.t_patch_size)
+                actual_end = min(end_idx + pad_size, S)
+                if actual_end - run < chunk_size + pad_size:
+                    # Pad by repeating last slice
+                    chunk_ims = ims[run:end_idx]
+                    chunk_height = height[run:end_idx]
+                    pad_needed = TrainConfig.t_patch_size - (chunk_size % TrainConfig.t_patch_size)
+                    chunk_ims = torch.cat([chunk_ims, chunk_ims[-1:].expand(pad_needed, -1, -1, -1)], dim=0)
+                    chunk_height = torch.cat([chunk_height, chunk_height[-1:].expand(pad_needed, -1, -1)], dim=0)
+                else:
+                    chunk_ims = ims[run:actual_end]
+                    chunk_height = height[run:actual_end]
+            else:
+                chunk_ims = ims[run:end_idx]
+                chunk_height = height[run:end_idx]
 
             st = time.monotonic()
-            metrics_dict = one_volume_step(
-                model, optimizer, scaler,
-                chunk_ims, chunk_height,
-                actual_frames, metrics
+            metrics.append(
+                "train",
+                one_supervised_step(
+                    model,
+                    optimizer,
+                    scaler,
+                    chunk_ims,
+                    chunk_height,
+                    metrics,
+                ),
             )
-            metrics.append("train", metrics_dict)
 
             if metrics.should_run_validation_partial_epoch():
-                validation_partial_epoch_volume(model, val_dataloader, metrics, config)
+                validation_partial_epoch(model, val_dataloader, metrics, "val_partial")
             if metrics.should_plot_losses():
                 metrics.plot_metrics()
 
             print(f"Step time: {time.monotonic() - st:.2f}s")
 
 
-def one_volume_step(
+@typechecked
+def one_supervised_step(
     model: nn.Module,
     optimizer: Optimizer,
     scaler: GradScaler,
-    images: Tensor,  # (B, T, C, H, W)
-    gt_boundaries: Tensor,  # (B, T, L, W)
-    valid_frames: int,
+    images: Float[Tensor, "slices channels height width"],
+    gt_boundaries: Float[Tensor, "slices layers width"],
     metrics: Metrics,
 ) -> dict[str, float]:
+    """Single training step on a volume chunk."""
     optimizer.zero_grad()
 
-    B, T, C, H, W = images.shape
+    T, C, H, W = images.shape
+
+    # Add batch dimension: (T, C, H, W) -> (1, T, C, H, W)
+    images_batch = images.unsqueeze(0)
 
     # Create ground truth masks for each slice
-    gt_masks = []
-    for t in range(T):
-        gt_mask = heightmap_to_volume(gt_boundaries[:, t], (H, W))
-        gt_masks.append(gt_mask)
-    gt_masks = torch.stack(gt_masks, dim=1)  # (B, T, H, W)
+    gt_masks = torch.stack([
+        heightmap_to_volume(gt_boundaries[t:t+1], (H, W))
+        for t in range(T)
+    ], dim=1).squeeze(2)  # (1, T, H, W)
 
     with torch.amp.autocast("cuda"):
-        logits = model(images)  # (B, T, num_classes, H, W)
+        # Get predictions: (1, T, num_classes, H, W)
+        logits = model(images_batch)
 
-        # Only compute loss on valid frames
-        logits_valid = logits[:, :valid_frames]
-        gt_masks_valid = gt_masks[:, :valid_frames]
-
-        # Reshape for cross entropy
-        logits_flat = logits_valid.reshape(-1, logits.shape[2], H, W)
-        gt_flat = gt_masks_valid.reshape(-1, H, W)
+        # Reshape for cross entropy: (T, num_classes, H, W) and (T, H, W)
+        logits_flat = logits.squeeze(0)  # (T, num_classes, H, W)
+        gt_flat = gt_masks.squeeze(0)  # (T, H, W)
 
         loss = F.cross_entropy(logits_flat, gt_flat)
 
     if metrics.should_save_train_images():
-        save_volume_segmentation(
-            images[:, :valid_frames],
-            gt_boundaries[:, :valid_frames],
-            logits[:, :valid_frames],
-            f"selected_images/octcube_train_{metrics.current_iter}.png"
-        )
-
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
-
-    result = {"loss": loss.item()}
-    result.update(compute_dice_scores_volume(
-        gt_boundaries[:, :valid_frames],
-        logits[:, :valid_frames]
-    ))
-    return result
-
-
-########################################################################
-# Sliding window mode training
-
-
-def sliding_window_supervised_epoch(
-    model: nn.Module,
-    optimizer: Optimizer,
-    scaler: GradScaler,
-    train_dataloader,
-    val_dataloader,
-    metrics: Metrics,
-    config: TrainConfig,
-):
-    """Training epoch for sliding window mode."""
-    model.train()
-
-    for batch in train_dataloader:
-        st = time.monotonic()
-
-        # Load data: (C, S, H, W) -> (S, C, H, W)
-        ims = einops.rearrange(batch["frames"], "c s h w -> s c h w").cuda()
-        height = einops.rearrange(batch["label"], "c l s w -> s l w").cuda()
-
-        S, C, H, W = ims.shape
-
-        # Resize if needed
-        if H != config.img_size or W != config.img_size:
-            ims = F.interpolate(ims, size=(config.img_size, config.img_size), mode='bilinear', align_corners=False)
-            scale = config.img_size / H
-            height = height * scale
-            # Resize width
-            height = F.interpolate(
-                height.unsqueeze(1),
-                size=(height.shape[1], config.img_size),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)
-
-        print(f"Data loading: {time.monotonic() - st:.2f}s")
-
-        # Process in batches with context
-        context = config.context_window
-        step_size = config.step_size
-
-        for start_idx in range(0, S, step_size):
-            end_idx = min(start_idx + step_size, S)
-
-            # Get context slices
-            ctx_start = max(0, start_idx - context)
-            ctx_end = min(S, end_idx + context)
-
-            # Current slices to segment
-            current_ims = ims[start_idx:end_idx]  # (T, C, H, W)
-            current_height = height[start_idx:end_idx]  # (T, L, W)
-
-            # Context before
-            if start_idx > 0:
-                context_before = ims[ctx_start:start_idx]
-            else:
-                context_before = ims[0:1].expand(context, -1, -1, -1)
-
-            # Context after
-            if end_idx < S:
-                context_after = ims[end_idx:ctx_end]
-            else:
-                context_after = ims[-1:].expand(context, -1, -1, -1)
-
-            # Pad context to exact size
-            if context_before.shape[0] < context:
-                pad_size = context - context_before.shape[0]
-                context_before = F.pad(
-                    context_before.unsqueeze(0),
-                    (0, 0, 0, 0, 0, 0, pad_size, 0),
-                    mode='replicate'
-                ).squeeze(0)
-            if context_after.shape[0] < context:
-                pad_size = context - context_after.shape[0]
-                context_after = F.pad(
-                    context_after.unsqueeze(0),
-                    (0, 0, 0, 0, 0, 0, 0, pad_size),
-                    mode='replicate'
-                ).squeeze(0)
-
-            st = time.monotonic()
-            metrics_dict = one_sliding_window_step(
-                model, optimizer, scaler,
-                current_ims, current_height,
-                context_before, context_after,
-                metrics
-            )
-            metrics.append("train", metrics_dict)
-
-            if metrics.should_run_validation_partial_epoch():
-                validation_partial_epoch_sliding(model, val_dataloader, metrics, config)
-            if metrics.should_plot_losses():
-                metrics.plot_metrics()
-
-            print(f"Step time: {time.monotonic() - st:.2f}s")
-
-
-def one_sliding_window_step(
-    model: nn.Module,
-    optimizer: Optimizer,
-    scaler: GradScaler,
-    current_ims: Tensor,  # (T, C, H, W)
-    gt_boundaries: Tensor,  # (T, L, W)
-    context_before: Tensor,  # (ctx, C, H, W)
-    context_after: Tensor,  # (ctx, C, H, W)
-    metrics: Metrics,
-) -> dict[str, float]:
-    optimizer.zero_grad()
-
-    T, C, H, W = current_ims.shape
-
-    # Build volume: (context_before, current, context_after)
-    volume = torch.cat([context_before, current_ims, context_after], dim=0)  # (T+2*ctx, C, H, W)
-    volume = volume.unsqueeze(0)  # (1, T+2*ctx, C, H, W)
-
-    # Ground truth masks
-    gt_masks = []
-    for t in range(T):
-        gt_mask = heightmap_to_volume(gt_boundaries[t:t+1], (H, W))
-        gt_masks.append(gt_mask)
-    gt_masks = torch.cat(gt_masks, dim=0)  # (T, H, W)
-
-    ctx = context_before.shape[0]
-
-    with torch.amp.autocast("cuda"):
-        # Get full volume prediction
-        logits = model(volume)  # (1, T+2*ctx, num_classes, H, W)
-
-        # Extract only the current slice predictions (center portion)
-        logits_center = logits[0, ctx:ctx+T]  # (T, num_classes, H, W)
-
-        loss = F.cross_entropy(logits_center, gt_masks)
-
-    if metrics.should_save_train_images():
-        save_slice_segmentation(
-            current_ims,
+        save_reconstruction_segmentation(
+            images,
             gt_boundaries,
-            logits_center,
-            f"selected_images/octcube_train_{metrics.current_iter}.png"
+            logits_flat,
+            f"selected_images/octcube_train_{metrics.current_iter}.png",
         )
 
     scaler.scale(loss).backward()
@@ -553,456 +322,259 @@ def one_sliding_window_step(
     scaler.update()
 
     result = {"loss": loss.item()}
-    result.update(compute_dice_scores(
-        gt_boundaries, logits_center, (H, W)
-    ))
+    result.update(compute_dice_scores(gt_boundaries, logits_flat, (H, W)))
     return result
 
 
-########################################################################
-# Validation
-
-
-def validation_partial_epoch_volume(model, dataloader, metrics, config):
-    """Partial validation for volume mode."""
-    from collections import defaultdict
-
-    print("Running Partial Validation (Volume Mode)")
-    model.eval()
-
-    results = defaultdict(float)
-    num_batches = 0
-    max_batches = 10
-
-    with torch.no_grad():
-        for batch in dataloader:
-            if num_batches >= max_batches:
-                break
-
-            ims = batch["frames"].permute(0, 1, 2, 3).unsqueeze(0).cuda()
-            height = batch["label"].permute(2, 0, 1, 3).unsqueeze(0).cuda()
-
-            B, S, C, H, W = ims.shape
-
-            if H != config.img_size or W != config.img_size:
-                ims = resize_volume(ims, (config.img_size, config.img_size))
-                height = resize_boundaries(height, (H, W), (config.img_size, config.img_size))
-
-            # Process first chunk only for speed
-            chunk_ims = ims[:, :config.num_frames]
-            chunk_height = height[:, :config.num_frames]
-
-            logits = model(chunk_ims)
-
-            # Compute metrics
-            local_metrics = compute_dice_scores_volume(chunk_height, logits)
-            for k, v in local_metrics.items():
-                results[k] += v
-
-            num_batches += 1
-
-    for k in results:
-        results[k] /= num_batches
-
-    metrics.append("val_partial", dict(results))
-    metrics.plot_metrics()
-    metrics.save("octcube_metrics.json")
-    model.train()
-
-
-def validation_partial_epoch_sliding(model, dataloader, metrics, config):
-    """Partial validation for sliding window mode."""
-    from collections import defaultdict
-
-    print("Running Partial Validation (Sliding Window Mode)")
-    model.eval()
-
-    results = defaultdict(float)
-    num_steps = 0
-    max_volumes = 10
-
-    context = config.context_window
-
-    with torch.no_grad():
-        for vol_idx, batch in enumerate(dataloader):
-            if vol_idx >= max_volumes:
-                break
-
-            ims = einops.rearrange(batch["frames"], "c s h w -> s c h w").cuda()
-            height = einops.rearrange(batch["label"], "c l s w -> s l w").cuda()
-
-            S, C, H, W = ims.shape
-
-            if H != config.img_size or W != config.img_size:
-                ims = F.interpolate(ims, size=(config.img_size, config.img_size), mode='bilinear', align_corners=False)
-                scale = config.img_size / H
-                height = height * scale
-                height = F.interpolate(
-                    height.unsqueeze(1),
-                    size=(height.shape[1], config.img_size),
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(1)
-                H, W = config.img_size, config.img_size
-
-            # Process a few chunks
-            for start_idx in range(0, min(S, config.step_size * 3), config.step_size):
-                end_idx = min(start_idx + config.step_size, S)
-
-                ctx_start = max(0, start_idx - context)
-                ctx_end = min(S, end_idx + context)
-
-                current_ims = ims[start_idx:end_idx]
-                current_height = height[start_idx:end_idx]
-
-                if start_idx > 0:
-                    context_before = ims[ctx_start:start_idx]
-                else:
-                    context_before = ims[0:1].expand(context, -1, -1, -1)
-
-                if end_idx < S:
-                    context_after = ims[end_idx:ctx_end]
-                else:
-                    context_after = ims[-1:].expand(context, -1, -1, -1)
-
-                if context_before.shape[0] < context:
-                    pad_size = context - context_before.shape[0]
-                    context_before = F.pad(
-                        context_before.unsqueeze(0),
-                        (0, 0, 0, 0, 0, 0, pad_size, 0),
-                        mode='replicate'
-                    ).squeeze(0)
-                if context_after.shape[0] < context:
-                    pad_size = context - context_after.shape[0]
-                    context_after = F.pad(
-                        context_after.unsqueeze(0),
-                        (0, 0, 0, 0, 0, 0, 0, pad_size),
-                        mode='replicate'
-                    ).squeeze(0)
-
-                volume = torch.cat([context_before, current_ims, context_after], dim=0)
-                volume = volume.unsqueeze(0)
-
-                logits = model(volume)
-                T = current_ims.shape[0]
-                logits_center = logits[0, context:context+T]
-
-                local_metrics = compute_dice_scores(current_height, logits_center, (H, W))
-                for k, v in local_metrics.items():
-                    results[k] += v
-                num_steps += 1
-
-    for k in results:
-        results[k] /= max(num_steps, 1)
-
-    metrics.append("val_partial", dict(results))
-    metrics.plot_metrics()
-    metrics.save("octcube_metrics.json")
-    model.train()
-
-
-def validation_epoch(model, dataloader, metrics, split, config):
+def validation_epoch(model, dataloader, metrics: Metrics, split):
     """Full validation epoch."""
     from collections import defaultdict
 
-    print(f"Running Full Validation ({split})")
+    print(f"Running validation: {split}")
     model.eval()
 
-    results = defaultdict(float)
+    results = defaultdict(lambda: 0.0)
     num_steps = 0
-    context = config.context_window
 
     with torch.no_grad():
         for batch in dataloader:
             ims = einops.rearrange(batch["frames"], "c s h w -> s c h w").cuda()
             height = einops.rearrange(batch["label"], "c l s w -> s l w").cuda()
-
             S, C, H, W = ims.shape
 
-            if H != config.img_size or W != config.img_size:
-                ims = F.interpolate(ims, size=(config.img_size, config.img_size), mode='bilinear', align_corners=False)
-                scale = config.img_size / H
-                height = height * scale
-                height = F.interpolate(
-                    height.unsqueeze(1),
-                    size=(height.shape[1], config.img_size),
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(1)
-                H, W = config.img_size, config.img_size
+            for run in range(0, S, TrainConfig.step_size):
+                end_idx = min(run + TrainConfig.step_size, S)
+                chunk_size = end_idx - run
 
-            for start_idx in range(0, S, config.step_size):
-                end_idx = min(start_idx + config.step_size, S)
-
-                ctx_start = max(0, start_idx - context)
-                ctx_end = min(S, end_idx + context)
-
-                current_ims = ims[start_idx:end_idx]
-                current_height = height[start_idx:end_idx]
-
-                if start_idx > 0:
-                    context_before = ims[ctx_start:start_idx]
+                # Pad if necessary
+                if chunk_size % TrainConfig.t_patch_size != 0:
+                    pad_size = TrainConfig.t_patch_size - (chunk_size % TrainConfig.t_patch_size)
+                    chunk_ims = ims[run:end_idx]
+                    chunk_height = height[run:end_idx]
+                    chunk_ims = torch.cat([chunk_ims, chunk_ims[-1:].expand(pad_size, -1, -1, -1)], dim=0)
+                    chunk_height = torch.cat([chunk_height, chunk_height[-1:].expand(pad_size, -1, -1)], dim=0)
                 else:
-                    context_before = ims[0:1].expand(context, -1, -1, -1)
+                    chunk_ims = ims[run:end_idx]
+                    chunk_height = height[run:end_idx]
 
-                if end_idx < S:
-                    context_after = ims[end_idx:ctx_end]
-                else:
-                    context_after = ims[-1:].expand(context, -1, -1, -1)
-
-                if context_before.shape[0] < context:
-                    pad_size = context - context_before.shape[0]
-                    context_before = F.pad(
-                        context_before.unsqueeze(0),
-                        (0, 0, 0, 0, 0, 0, pad_size, 0),
-                        mode='replicate'
-                    ).squeeze(0)
-                if context_after.shape[0] < context:
-                    pad_size = context - context_after.shape[0]
-                    context_after = F.pad(
-                        context_after.unsqueeze(0),
-                        (0, 0, 0, 0, 0, 0, 0, pad_size),
-                        mode='replicate'
-                    ).squeeze(0)
-
-                volume = torch.cat([context_before, current_ims, context_after], dim=0)
-                volume = volume.unsqueeze(0)
-
-                logits = model(volume)
-                T = current_ims.shape[0]
-                logits_center = logits[0, context:context+T]
-
-                local_metrics = compute_dice_scores(current_height, logits_center, (H, W))
+                local_metrics = one_validation_step(
+                    model,
+                    chunk_ims,
+                    chunk_height,
+                    metrics,
+                    num_steps == 0,
+                    split,
+                )
                 for k, v in local_metrics.items():
                     results[k] += v
                 num_steps += 1
 
-    for k in results:
-        results[k] /= max(num_steps, 1)
+    for k, v in results.items():
+        results[k] = v / max(num_steps, 1)
 
     metrics.append(split, dict(results))
+    metrics.print_latest(split)
     metrics.plot_metrics()
 
 
-########################################################################
-# Visualization
+def validation_partial_epoch(model, dataloader, metrics: Metrics, split):
+    """Partial validation on subset of data."""
+    from collections import defaultdict
+
+    print("Running Partial Validation")
+    model.eval()
+
+    results = defaultdict(lambda: 0.0)
+    num_steps = 0
+    max_vols = 10
+
+    with torch.no_grad():
+        for vol_idx, batch in enumerate(dataloader):
+            if vol_idx >= max_vols:
+                break
+
+            ims = einops.rearrange(batch["frames"], "c s h w -> s c h w").cuda()
+            height = einops.rearrange(batch["label"], "c l s w -> s l w").cuda()
+            S, C, H, W = ims.shape
+
+            # Just process first chunk for speed
+            end_idx = min(TrainConfig.step_size, S)
+            chunk_size = end_idx
+
+            if chunk_size % TrainConfig.t_patch_size != 0:
+                pad_size = TrainConfig.t_patch_size - (chunk_size % TrainConfig.t_patch_size)
+                chunk_ims = ims[:end_idx]
+                chunk_height = height[:end_idx]
+                chunk_ims = torch.cat([chunk_ims, chunk_ims[-1:].expand(pad_size, -1, -1, -1)], dim=0)
+                chunk_height = torch.cat([chunk_height, chunk_height[-1:].expand(pad_size, -1, -1)], dim=0)
+            else:
+                chunk_ims = ims[:end_idx]
+                chunk_height = height[:end_idx]
+
+            local_metrics = one_validation_step(
+                model,
+                chunk_ims,
+                chunk_height,
+                metrics,
+                vol_idx == 0,
+                split,
+            )
+            for k, v in local_metrics.items():
+                results[k] += v
+            num_steps += 1
+
+    for k, v in results.items():
+        results[k] = v / max(num_steps, 1)
+
+    metrics.append(split, dict(results))
+    metrics.print_latest(split)
+    metrics.plot_metrics()
+    metrics.save("octcube_metrics.json")
+    model.train()
 
 
-def save_volume_segmentation(images, gt_boundaries, logits, fname):
-    """Save visualization for volume predictions."""
-    # Show first slice
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+def one_validation_step(
+    model,
+    images,
+    gt_boundaries,
+    metrics,
+    save_images,
+    split,
+):
+    """Single validation step on a volume chunk."""
+    T, C, H, W = images.shape
 
-    B, T, C, H, W = images.shape
+    # Add batch dimension
+    images_batch = images.unsqueeze(0)
 
-    # Original
-    axes[0].imshow(images[0, 0, 0].cpu().numpy(), cmap='gray')
-    axes[0].set_title(f"Original (slice 0/{T})")
+    # Create ground truth masks
+    gt_masks = torch.stack([
+        heightmap_to_volume(gt_boundaries[t:t+1], (H, W))
+        for t in range(T)
+    ], dim=1).squeeze(2)
 
-    # GT segmentation
-    gt_mask = heightmap_to_volume(gt_boundaries[0, 0:1], (H, W)).cpu().numpy()
-    axes[1].imshow(gt_mask[0], cmap='viridis')
-    axes[1].set_title("GT Segmentation")
+    with torch.no_grad():
+        logits = model(images_batch)
+        logits_flat = logits.squeeze(0)
+        gt_flat = gt_masks.squeeze(0)
+        loss = F.cross_entropy(logits_flat, gt_flat)
 
-    # Predicted segmentation
-    pred_mask = logits[0, 0].argmax(0).cpu().numpy()
-    axes[2].imshow(pred_mask, cmap='viridis')
-    axes[2].set_title("Predicted Segmentation")
+    if save_images:
+        save_reconstruction_segmentation(
+            images,
+            gt_boundaries,
+            logits_flat,
+            f"selected_images/octcube_{split}_{metrics.current_iter}.png",
+        )
 
-    for ax in axes:
-        ax.axis('off')
+    result = {"loss": loss.item()}
+    result.update(compute_dice_scores(gt_boundaries, logits_flat, (H, W)))
+    return result
 
-    plt.tight_layout()
+
+def save_reconstruction_segmentation(images, gt_boundaries, logits, fname):
+    """Save visualization of segmentation results."""
     os.makedirs(os.path.dirname(fname), exist_ok=True)
-    plt.savefig(fname)
-    plt.close()
 
-
-def save_slice_segmentation(images, gt_boundaries, logits, fname):
-    """Save visualization for slice predictions."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 10))
 
     T, C, H, W = images.shape
 
-    # Original
-    axes[0].imshow(images[0, 0].cpu().numpy(), cmap='gray')
+    # Original (first slice)
+    axes[0].imshow(images[0, 0].cpu().detach().numpy(), cmap="gray")
     axes[0].set_title(f"Original (slice 0/{T})")
 
     # GT segmentation
-    gt_mask = heightmap_to_volume(gt_boundaries[0:1], (H, W)).cpu().numpy()
-    axes[1].imshow(gt_mask[0], cmap='viridis')
-    axes[1].set_title("GT Segmentation")
+    segmentation_gt = heightmap_to_volume(gt_boundaries[:1], (H, W)).cpu().detach().numpy()
+    axes[1].imshow(segmentation_gt[0], cmap="viridis")
+    axes[1].set_title("Segmentation GT")
 
     # Predicted segmentation
-    pred_mask = logits[0].argmax(0).cpu().numpy()
-    axes[2].imshow(pred_mask, cmap='viridis')
-    axes[2].set_title("Predicted Segmentation")
+    seg_pred = logits[0].argmax(0).cpu().detach().numpy().astype(int)
+    axes[2].imshow(seg_pred, cmap="viridis")
+    axes[2].set_title("Segmentation Pred")
 
-    for ax in axes:
-        ax.axis('off')
+    for ax in axes.flat:
+        ax.axis("off")
 
     plt.tight_layout()
-    os.makedirs(os.path.dirname(fname), exist_ok=True)
     plt.savefig(fname)
     plt.close()
 
 
-########################################################################
-# Main training functions
-
-
-def full_supervised_run(config: TrainConfig):
+def full_supervised_run():
     """Main training function."""
-
-    # Create output directories
-    os.makedirs(config.save_dir, exist_ok=True)
     os.makedirs("selected_images", exist_ok=True)
 
-    # Create data loaders
     train_loader = torch.utils.data.DataLoader(
-        SpectralisLoader(split_label="train", target_size=(config.img_size, config.img_size), normalize=True),
+        SpectralisLoader(
+            split_label="train",
+            target_size=(TrainConfig.img_size, TrainConfig.img_size),
+            normalize=True
+        ),
         batch_size=1,
-        num_workers=4,
-        shuffle=True,
+        num_workers=5,
     )
     val_loader = torch.utils.data.DataLoader(
-        SpectralisLoader(split_label="val", target_size=(config.img_size, config.img_size), normalize=True),
+        SpectralisLoader(
+            split_label="val",
+            target_size=(TrainConfig.img_size, TrainConfig.img_size),
+            normalize=True
+        ),
         batch_size=1,
-        num_workers=4,
+        num_workers=5,
     )
     test_loader = torch.utils.data.DataLoader(
-        SpectralisLoader(split_label="test", target_size=(config.img_size, config.img_size), normalize=True),
+        SpectralisLoader(
+            split_label="test",
+            target_size=(TrainConfig.img_size, TrainConfig.img_size),
+            normalize=True
+        ),
         batch_size=1,
-        num_workers=4,
+        num_workers=5,
     )
     print("Loaded data loaders")
 
-    # Create model
-    num_classes = 12  # 11 boundaries + 1 background
+    model = OCTCubeSegmenter(
+        num_classes=TrainConfig.num_classes,
+        img_size=TrainConfig.img_size,
+        patch_size=TrainConfig.patch_size,
+        num_frames=TrainConfig.num_frames,
+        t_patch_size=TrainConfig.t_patch_size,
+        size=TrainConfig.model_size,
+        freeze_encoder=True,
+        checkpoint_path=TrainConfig.checkpoint_path,
+    ).cuda()
+    print("Initialized Model")
 
-    if config.mode == 'volume':
-        model = OCTCubeSegmenter(
-            num_classes=num_classes,
-            img_size=config.img_size,
-            patch_size=config.patch_size,
-            num_frames=config.num_frames,
-            size=config.model_size,
-            freeze_encoder=True,
-            checkpoint_path=config.checkpoint_path,
-        ).cuda()
-    else:  # sliding_window
-        total_frames = 2 * config.context_window + config.step_size
-        model = OCTCubeSegmenter(
-            num_classes=num_classes,
-            img_size=config.img_size,
-            patch_size=config.patch_size,
-            num_frames=total_frames,
-            size=config.model_size,
-            freeze_encoder=True,
-            checkpoint_path=config.checkpoint_path,
-        ).cuda()
-
-    print(f"Initialized OCTCube model ({config.mode} mode)")
-
-    # Optimizer and scaler
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=1e-4,
-        weight_decay=0.01,
+        lr=1e-3
     )
     scaler = GradScaler("cuda")
-    print("Initialized optimizer")
+    print("Initialized Optimizer")
 
-    # Metrics
     metrics = Metrics()
-    print("Initialized metrics")
+    print("Initialized Metrics")
 
-    # Training loop
-    for epoch in range(1, config.epochs + 1):
-        metrics.current_epoch = epoch
-        print(f"\n{'='*50}")
-        print(f"Epoch {epoch}/{config.epochs}")
-        print(f"{'='*50}")
+    for e in range(1, TrainConfig.epochs + 1):
+        metrics.current_epoch = e
+        print(f"Epoch: {e}")
+        supervised_epoch(
+            model,
+            optimizer,
+            scaler,
+            train_loader,
+            val_loader,
+            metrics,
+        )
 
-        if config.mode == 'volume':
-            volume_supervised_epoch(
-                model, optimizer, scaler,
-                train_loader, val_loader, metrics, config
-            )
-        else:
-            sliding_window_supervised_epoch(
-                model, optimizer, scaler,
-                train_loader, val_loader, metrics, config
-            )
+        print("validation")
+        validation_epoch(model, val_loader, metrics, "val")
 
-        # Full validation
-        print("\nRunning full validation...")
-        validation_epoch(model, val_loader, metrics, "val", config)
-
-        # Save checkpoint
-        checkpoint_path = os.path.join(config.save_dir, f"octcube_epoch_{epoch}.pth")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'metrics': metrics.data,
-        }, checkpoint_path)
-        print(f"Saved checkpoint to {checkpoint_path}")
-
-    # Test
-    print("\n" + "="*50)
-    print("Running test evaluation...")
-    print("="*50)
-    validation_epoch(model, test_loader, metrics, "test", config)
-
-    # Save final metrics
-    metrics.save("octcube_metrics_final.json")
-    metrics.plot_metrics()
-
-    print("\nTraining complete!")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Train OCTCube segmentation model")
-    parser.add_argument('--mode', type=str, default='sliding_window',
-                        choices=['volume', 'sliding_window'],
-                        help='Training mode: volume (full volume) or sliding_window (with context)')
-    parser.add_argument('--img_size', type=int, default=224, help='Image size')
-    parser.add_argument('--patch_size', type=int, default=16, help='Patch size')
-    parser.add_argument('--num_frames', type=int, default=48, help='Number of frames for volume mode')
-    parser.add_argument('--step_size', type=int, default=48, help='Step size for processing')
-    parser.add_argument('--context_window', type=int, default=5, help='Context window for sliding mode')
-    parser.add_argument('--model_size', type=str, default='large', choices=['base', 'large'])
-    parser.add_argument('--epochs', type=int, default=20, help='Number of epochs')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Path to pretrained checkpoint')
-    parser.add_argument('--save_dir', type=str, default='checkpoints_octcube', help='Save directory')
-
-    args = parser.parse_args()
-
-    config = TrainConfig(
-        mode=args.mode,
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        num_frames=args.num_frames,
-        step_size=args.step_size,
-        context_window=args.context_window,
-        model_size=args.model_size,
-        epochs=args.epochs,
-        checkpoint_path=args.checkpoint,
-        save_dir=args.save_dir,
-    )
-
-    print("Training Configuration:")
-    print(f"  Mode: {config.mode}")
-    print(f"  Image size: {config.img_size}")
-    print(f"  Patch size: {config.patch_size}")
-    print(f"  Model size: {config.model_size}")
-    print(f"  Epochs: {config.epochs}")
-    print(f"  Checkpoint: {config.checkpoint_path}")
-    print()
-
-    full_supervised_run(config)
+    print("testing")
+    validation_epoch(model, test_loader, metrics, "test")
 
 
 if __name__ == "__main__":
-    main()
+    full_supervised_run()

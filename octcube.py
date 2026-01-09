@@ -241,18 +241,17 @@ class PatchEmbed3D(nn.Module):
     3D Patch Embedding for OCT volumes.
 
     Handles input of shape (B, T, C, H, W) where T is the number of slices.
-    Can use either 3D convolutions or 2D convolutions applied per-slice.
+    Uses 3D convolution for joint spatial-temporal patching (matching OCTCube checkpoint).
     """
 
     def __init__(
         self,
-        img_size: int = 224,
+        img_size: int = 512,
         patch_size: int = 16,
         in_chans: int = 1,
         embed_dim: int = 1024,
         num_frames: int = 48,
-        t_patch_size: int = 1,
-        use_3d_conv: bool = False,
+        t_patch_size: int = 3,
     ):
         super().__init__()
         self.img_size = img_size
@@ -261,27 +260,18 @@ class PatchEmbed3D(nn.Module):
         self.embed_dim = embed_dim
         self.num_frames = num_frames
         self.t_patch_size = t_patch_size
-        self.use_3d_conv = use_3d_conv
 
         self.grid_size = img_size // patch_size
         self.num_patches_spatial = self.grid_size * self.grid_size
         self.num_patches_temporal = num_frames // t_patch_size
         self.num_patches = self.num_patches_spatial * self.num_patches_temporal
 
-        if use_3d_conv:
-            # 3D convolution for joint spatial-temporal patching
-            self.proj = nn.Conv3d(
-                in_chans, embed_dim,
-                kernel_size=(t_patch_size, patch_size, patch_size),
-                stride=(t_patch_size, patch_size, patch_size)
-            )
-        else:
-            # 2D convolution applied per-slice
-            self.proj = nn.Conv2d(
-                in_chans, embed_dim,
-                kernel_size=patch_size,
-                stride=patch_size
-            )
+        # 3D convolution for joint spatial-temporal patching (matches OCTCube checkpoint)
+        self.proj = nn.Conv3d(
+            in_chans, embed_dim,
+            kernel_size=(t_patch_size, patch_size, patch_size),
+            stride=(t_patch_size, patch_size, patch_size)
+        )
 
     def forward(self, x):
         """
@@ -292,25 +282,16 @@ class PatchEmbed3D(nn.Module):
         """
         B, T, C, H, W = x.shape
 
-        if self.use_3d_conv:
-            # (B, T, C, H, W) -> (B, C, T, H, W)
-            x = x.permute(0, 2, 1, 3, 4)
-            x = self.proj(x)  # (B, D, T', H', W')
-            # (B, D, T', H', W') -> (B, T', H'*W', D)
-            x = x.permute(0, 2, 3, 4, 1)
-            x = x.reshape(B, -1, self.grid_size * self.grid_size, self.embed_dim)
-        else:
-            # Process each slice with 2D conv
-            x = rearrange(x, 'b t c h w -> (b t) c h w')
-            x = self.proj(x)  # (B*T, D, H', W')
-            x = rearrange(x, '(b t) d h w -> b t (h w) d', b=B, t=T)
+        # (B, T, C, H, W) -> (B, C, T, H, W)
+        x = x.permute(0, 2, 1, 3, 4)
+        x = self.proj(x)  # (B, D, T', H', W')
 
-            # Handle temporal patching if t_patch_size > 1
-            if self.t_patch_size > 1:
-                T_new = T // self.t_patch_size
-                x = rearrange(x, 'b (t p) l d -> b t l (p d)', p=self.t_patch_size)
-                # Project back to embed_dim
-                x = x[..., :self.embed_dim]  # Simple truncation; could use a linear layer
+        # Get actual output dimensions
+        _, D, T_out, H_out, W_out = x.shape
+
+        # (B, D, T', H', W') -> (B, T', H'*W', D)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = x.reshape(B, T_out, H_out * W_out, D)
 
         return x
 
@@ -325,15 +306,19 @@ class OCTCubeViT(nn.Module):
 
     Based on the OCTCube architecture that processes 3D volumes with
     separate positional embeddings for spatial and temporal dimensions.
+
+    Default parameters match the OCTCube checkpoint:
+    - img_size=512, patch_size=16 -> 32x32 = 1024 spatial patches
+    - t_patch_size=3 for temporal patching
     """
 
     def __init__(
         self,
-        img_size: int = 224,
+        img_size: int = 512,
         patch_size: int = 16,
         in_chans: int = 1,
         num_frames: int = 48,
-        t_patch_size: int = 1,
+        t_patch_size: int = 3,
         embed_dim: int = 1024,
         depth: int = 24,
         num_heads: int = 16,
@@ -362,7 +347,7 @@ class OCTCubeViT(nn.Module):
         self.cls_embed = cls_embed
         self.global_pool = global_pool
 
-        # Patch embedding
+        # Patch embedding (uses 3D conv matching checkpoint)
         self.patch_embed = PatchEmbed3D(
             img_size=img_size,
             patch_size=patch_size,
@@ -370,12 +355,11 @@ class OCTCubeViT(nn.Module):
             embed_dim=embed_dim,
             num_frames=num_frames,
             t_patch_size=t_patch_size,
-            use_3d_conv=False,
         )
 
         self.grid_size = img_size // patch_size
-        self.num_patches_spatial = self.grid_size * self.grid_size
-        self.num_patches_temporal = num_frames // t_patch_size
+        self.num_patches_spatial = self.grid_size * self.grid_size  # 32*32 = 1024 for 512/16
+        self.num_patches_temporal = num_frames // t_patch_size  # 48/3 = 16
 
         # Class token
         if cls_embed:
@@ -536,15 +520,19 @@ class OCTCubeViT(nn.Module):
 class OCTCubeWrapper(nn.Module):
     """
     Wrapper for OCTCube model with easy configuration and weight loading.
+
+    Default parameters match the OCTCube checkpoint:
+    - img_size=512, patch_size=16 -> 32x32 = 1024 spatial patches
+    - t_patch_size=3, num_frames=48 -> 16 temporal patches
     """
 
     def __init__(
         self,
-        img_size: int = 224,
+        img_size: int = 512,
         patch_size: int = 16,
         in_chans: int = 1,
         num_frames: int = 48,
-        t_patch_size: int = 1,
+        t_patch_size: int = 3,
         size: str = 'large',  # 'base' or 'large'
         drop_path_rate: float = 0.1,
     ):
@@ -591,7 +579,7 @@ class OCTCubeWrapper(nn.Module):
             raise ValueError(f"Unknown model size: {size}")
 
         print(f"Created OCTCube-{size} model with img_size={img_size}, "
-              f"patch_size={patch_size}, num_frames={num_frames}")
+              f"patch_size={patch_size}, num_frames={num_frames}, t_patch_size={t_patch_size}")
 
     def forward(self, x, return_all_tokens=False):
         """
@@ -667,7 +655,11 @@ class OCTCubeSegHead(nn.Module):
     Segmentation head for OCTCube that produces per-slice segmentations.
 
     Takes tokens from OCTCube and upsamples to produce full-resolution
-    segmentation masks for each slice.
+    segmentation masks for each temporal patch group.
+
+    Note: OCTCube uses t_patch_size=3, so T input slices become T/3 temporal tokens.
+    The head produces T/3 segmentation maps which need to be upsampled temporally
+    if per-slice output is needed.
     """
 
     def __init__(
@@ -675,9 +667,8 @@ class OCTCubeSegHead(nn.Module):
         num_classes: int,
         in_dim: int = 1024,
         hidden_dim: int = 96,
-        patch_grid: Tuple[int, int] = (14, 14),
+        patch_grid: Tuple[int, int] = (32, 32),  # 512/16 = 32
         num_blocks: int = 4,
-        upsample_factor: int = 4,
     ):
         super().__init__()
 
@@ -695,28 +686,31 @@ class OCTCubeSegHead(nn.Module):
             ConvNeXtBlock(hidden_dim, expansion=4) for _ in range(num_blocks)
         ])
 
-        self.upsample = nn.Upsample(scale_factor=upsample_factor, mode='bilinear', align_corners=False)
+        # Upsample from (h*8, w*8) = (256, 256) to (512, 512)
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.head = nn.Conv2d(hidden_dim, num_classes, 1)
 
-    def forward(self, tokens):
+    def forward(self, tokens, target_temporal_size: Optional[int] = None):
         """
         Args:
-            tokens: (B, T, L, D) tensor from OCTCube
+            tokens: (B, T_tokens, L, D) tensor from OCTCube
+                    where T_tokens = num_frames / t_patch_size
+            target_temporal_size: if provided, upsample temporally to this size
 
         Returns:
-            (B, T, num_classes, H, W) segmentation logits per slice
+            (B, T_out, num_classes, H, W) segmentation logits
+            where T_out = target_temporal_size if provided, else T_tokens
         """
         B, T, L, D = tokens.shape
         h, w = self.patch_grid
 
-        # Verify patch count matches
+        # Handle different spatial dimensions
         expected_L = h * w
         if L != expected_L:
-            # Handle different spatial dimensions
             actual_h = actual_w = int(L ** 0.5)
             h, w = actual_h, actual_w
 
-        # Process each slice
+        # Process all temporal tokens at once
         # (B, T, L, D) -> (B*T, L, D)
         tokens = rearrange(tokens, 'b t l d -> (b t) l d')
 
@@ -730,12 +724,21 @@ class OCTCubeSegHead(nn.Module):
         # Apply ConvNeXt blocks
         x = self.blocks(x)
 
-        # Upsample and predict
+        # Upsample spatially and predict
         x = self.upsample(x)
         x = self.head(x)
 
         # Reshape back: (B*T, C, H, W) -> (B, T, C, H, W)
+        _, C, H, W = x.shape
         x = rearrange(x, '(b t) c h w -> b t c h w', b=B, t=T)
+
+        # Optionally upsample temporally to match original number of slices
+        if target_temporal_size is not None and target_temporal_size != T:
+            # (B, T, C, H, W) -> (B, C, T, H, W) for interpolation
+            x = x.permute(0, 2, 1, 3, 4)
+            x = F.interpolate(x, size=(target_temporal_size, H, W), mode='trilinear', align_corners=False)
+            # Back to (B, T, C, H, W)
+            x = x.permute(0, 2, 1, 3, 4)
 
         return x
 
@@ -750,14 +753,19 @@ class OCTCubeSegmenter(nn.Module):
 
     Combines the OCTCube encoder with a ConvNeXt-based segmentation head
     to produce per-slice segmentations from 3D OCT volumes.
+
+    Default parameters match the OCTCube checkpoint:
+    - img_size=512, patch_size=16
+    - num_frames=48, t_patch_size=3
     """
 
     def __init__(
         self,
         num_classes: int = 12,
-        img_size: int = 224,
+        img_size: int = 512,
         patch_size: int = 16,
         num_frames: int = 48,
+        t_patch_size: int = 3,
         size: str = 'large',
         freeze_encoder: bool = True,
         checkpoint_path: Optional[str] = None,
@@ -768,6 +776,7 @@ class OCTCubeSegmenter(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_frames = num_frames
+        self.t_patch_size = t_patch_size
 
         # Create encoder
         self.encoder = OCTCubeWrapper(
@@ -775,6 +784,7 @@ class OCTCubeSegmenter(nn.Module):
             patch_size=patch_size,
             in_chans=1,
             num_frames=num_frames,
+            t_patch_size=t_patch_size,
             size=size,
         )
 
@@ -797,115 +807,34 @@ class OCTCubeSegmenter(nn.Module):
             patch_grid=(grid_size, grid_size),
         )
 
-        print(f"Created OCTCubeSegmenter with {num_classes} classes")
+        print(f"Created OCTCubeSegmenter with {num_classes} classes, "
+              f"img_size={img_size}, num_frames={num_frames}")
 
-    def forward(self, x):
+    def forward(self, x, return_per_slice: bool = True):
         """
         Args:
             x: (B, T, C, H, W) tensor of OCT volume
                OR (B, T, H, W) which will be unsqueezed
+            return_per_slice: if True, upsample temporally to return per-slice predictions
 
         Returns:
-            (B, T, num_classes, H, W) segmentation logits per slice
+            (B, T, num_classes, H, W) segmentation logits per slice if return_per_slice
+            (B, T/t_patch_size, num_classes, H, W) otherwise
         """
         # Handle missing channel dimension
         if x.dim() == 4:
             x = x.unsqueeze(2)  # (B, T, H, W) -> (B, T, 1, H, W)
 
-        # Get tokens from encoder
-        tokens = self.encoder(x, return_all_tokens=True)  # (B, T, L, D)
+        B, T, C, H, W = x.shape
 
-        # Get segmentation
-        logits = self.head(tokens)  # (B, T, num_classes, H, W)
+        # Get tokens from encoder
+        tokens = self.encoder(x, return_all_tokens=True)  # (B, T/t_patch_size, L, D)
+
+        # Get segmentation with optional temporal upsampling
+        target_T = T if return_per_slice else None
+        logits = self.head(tokens, target_temporal_size=target_T)
 
         return logits
-
-    def forward_single_slice(self, x):
-        """
-        Forward pass for a batch of single slices (for compatibility with MIRAGE training).
-
-        Args:
-            x: (B, C, H, W) tensor of single slices
-
-        Returns:
-            (B, num_classes, H, W) segmentation logits
-        """
-        # Add temporal dimension
-        x = x.unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
-
-        # Get segmentation
-        logits = self.forward(x)  # (B, 1, num_classes, H, W)
-
-        # Remove temporal dimension
-        return logits.squeeze(1)  # (B, num_classes, H, W)
-
-
-########################################################################
-# Slice-wise OCTCube Segmenter (processes volume but outputs slice-by-slice)
-
-
-class OCTCubeSliceSegmenter(nn.Module):
-    """
-    OCTCube segmenter that processes volumes with temporal context
-    but produces slice-by-slice outputs compatible with the existing
-    training loop that expects (B, num_classes, H, W) outputs.
-
-    This is useful when you want to leverage OCTCube's 3D context
-    but still train with the same interface as MIRAGE.
-    """
-
-    def __init__(
-        self,
-        num_classes: int = 12,
-        img_size: int = 224,
-        patch_size: int = 16,
-        context_frames: int = 5,  # Number of neighboring slices to use as context
-        size: str = 'large',
-        freeze_encoder: bool = True,
-        checkpoint_path: Optional[str] = None,
-    ):
-        super().__init__()
-
-        self.num_classes = num_classes
-        self.context_frames = context_frames
-        self.total_frames = 2 * context_frames + 1
-
-        self.segmenter = OCTCubeSegmenter(
-            num_classes=num_classes,
-            img_size=img_size,
-            patch_size=patch_size,
-            num_frames=self.total_frames,
-            size=size,
-            freeze_encoder=freeze_encoder,
-            checkpoint_path=checkpoint_path,
-        )
-
-    def forward(self, x, context_before=None, context_after=None):
-        """
-        Args:
-            x: (B, C, H, W) current slices to segment
-            context_before: (B, context_frames, C, H, W) preceding slices (optional)
-            context_after: (B, context_frames, C, H, W) following slices (optional)
-
-        Returns:
-            (B, num_classes, H, W) segmentation logits for the center slices
-        """
-        B, C, H, W = x.shape
-
-        if context_before is None or context_after is None:
-            # No context provided, just process single slices
-            return self.segmenter.forward_single_slice(x)
-
-        # Build volume: [context_before, x, context_after]
-        x_center = x.unsqueeze(1)  # (B, 1, C, H, W)
-        volume = torch.cat([context_before, x_center, context_after], dim=1)
-
-        # Get full volume segmentation
-        logits = self.segmenter(volume)  # (B, T, num_classes, H, W)
-
-        # Return only the center slice segmentation
-        center_idx = self.context_frames
-        return logits[:, center_idx]  # (B, num_classes, H, W)
 
 
 ########################################################################
@@ -913,31 +842,24 @@ class OCTCubeSliceSegmenter(nn.Module):
 
 
 if __name__ == "__main__":
-    import argparse
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--size', type=str, default='large', choices=['base', 'large'])
-    parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'])
-    parser.add_argument('--checkpoint', type=str, default=None, help='Path to pretrained weights')
-    args = parser.parse_args()
-
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-
-    # Create model
+    # Create model with default OCTCube parameters
     model = OCTCubeSegmenter(
         num_classes=12,
-        img_size=224,
+        img_size=512,
         patch_size=16,
         num_frames=48,
-        size=args.size,
+        t_patch_size=3,
+        size='large',
         freeze_encoder=True,
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=None,  # Set path to your checkpoint here
     ).to(device)
 
     print(f"\nModel created on {device}")
 
-    # Test with random input
-    B, T, C, H, W = 2, 48, 1, 224, 224
+    # Test with random input matching OCTCube expectations
+    B, T, C, H, W = 1, 48, 1, 512, 512
     x = torch.randn(B, T, C, H, W, device=device)
 
     print(f"Input shape: {x.shape}")
@@ -947,10 +869,3 @@ if __name__ == "__main__":
 
     print(f"Output shape: {out.shape}")
     print(f"Expected: ({B}, {T}, 12, {H}, {W})")
-
-    # Test single slice mode
-    x_single = torch.randn(4, 1, 224, 224, device=device)
-    with torch.no_grad():
-        out_single = model.forward_single_slice(x_single)
-    print(f"\nSingle slice input: {x_single.shape}")
-    print(f"Single slice output: {out_single.shape}")
