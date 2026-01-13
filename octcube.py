@@ -672,6 +672,706 @@ class OCTCubeWrapper(nn.Module):
 
 
 ########################################################################
+# MAE Decoder for Reconstruction
+
+
+class MAEDecoder(nn.Module):
+    """
+    MAE Decoder for OCTCube reconstruction.
+
+    Matches the OCTCube checkpoint structure:
+    - 8 decoder blocks
+    - 512 embed dim
+    - 16 heads
+    """
+
+    def __init__(
+        self,
+        encoder_embed_dim: int = 1024,
+        decoder_embed_dim: int = 512,
+        decoder_depth: int = 8,
+        decoder_num_heads: int = 16,
+        mlp_ratio: float = 4.,
+        patch_size: int = 16,
+        t_patch_size: int = 3,
+        in_chans: int = 1,
+        num_patches_spatial: int = 1024,  # 32x32
+        num_patches_temporal: int = 16,   # 48/3
+        norm_layer=None,
+    ):
+        super().__init__()
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+
+        self.decoder_embed_dim = decoder_embed_dim
+        self.patch_size = patch_size
+        self.t_patch_size = t_patch_size
+        self.in_chans = in_chans
+        self.num_patches_spatial = num_patches_spatial
+        self.num_patches_temporal = num_patches_temporal
+
+        # Encoder to decoder projection
+        self.decoder_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim)
+
+        # Mask token for MAE
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
+        # Decoder cls token
+        self.decoder_cls_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
+        # Separate positional embeddings for decoder
+        self.decoder_pos_embed_spatial = nn.Parameter(
+            torch.zeros(1, num_patches_spatial, decoder_embed_dim)
+        )
+        self.decoder_pos_embed_temporal = nn.Parameter(
+            torch.zeros(1, num_patches_temporal, decoder_embed_dim)
+        )
+        self.decoder_pos_embed_class = nn.Parameter(
+            torch.zeros(1, 1, decoder_embed_dim)
+        )
+
+        # Decoder transformer blocks
+        self.decoder_blocks = nn.ModuleList([
+            Block(
+                dim=decoder_embed_dim,
+                num_heads=decoder_num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True,
+                norm_layer=norm_layer,
+            )
+            for _ in range(decoder_depth)
+        ])
+
+        self.decoder_norm = norm_layer(decoder_embed_dim)
+
+        # Prediction head: project to pixel values
+        # Output: t_patch_size * patch_size * patch_size * in_chans per token
+        self.decoder_pred = nn.Linear(
+            decoder_embed_dim,
+            t_patch_size * patch_size * patch_size * in_chans
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        trunc_normal_(self.mask_token, std=0.02)
+        trunc_normal_(self.decoder_cls_token, std=0.02)
+        trunc_normal_(self.decoder_pos_embed_spatial, std=0.02)
+        trunc_normal_(self.decoder_pos_embed_temporal, std=0.02)
+        trunc_normal_(self.decoder_pos_embed_class, std=0.02)
+
+    def forward(self, x, T_patches: int, L_patches: int):
+        """
+        Decode encoder tokens to reconstructed patches.
+
+        Args:
+            x: (B, N, D) encoder output tokens (may include cls token)
+            T_patches: number of temporal patches
+            L_patches: number of spatial patches per temporal slice
+
+        Returns:
+            (B, T_patches, L_patches, t_patch_size * patch_size * patch_size * in_chans)
+        """
+        B = x.shape[0]
+
+        # Project to decoder dimension
+        x = self.decoder_embed(x)  # (B, N, decoder_embed_dim)
+
+        # Check if cls token is present (N = T*L + 1 or N = T*L)
+        expected_tokens = T_patches * L_patches
+        has_cls = x.shape[1] == expected_tokens + 1
+
+        if has_cls:
+            # Separate cls token
+            cls_token = x[:, :1]
+            x = x[:, 1:]  # (B, T*L, D)
+        else:
+            cls_token = self.decoder_cls_token.expand(B, -1, -1)
+
+        # Reshape to (B, T, L, D) for positional embedding
+        x = x.reshape(B, T_patches, L_patches, -1)
+
+        # Add spatial and temporal positional embeddings
+        # Interpolate if needed
+        if L_patches != self.num_patches_spatial:
+            grid_size = int(L_patches ** 0.5)
+            orig_grid = int(self.num_patches_spatial ** 0.5)
+            pos_spatial = self.decoder_pos_embed_spatial.reshape(1, orig_grid, orig_grid, -1)
+            pos_spatial = pos_spatial.permute(0, 3, 1, 2)
+            pos_spatial = F.interpolate(pos_spatial, size=(grid_size, grid_size), mode='bicubic', align_corners=False)
+            pos_spatial = pos_spatial.permute(0, 2, 3, 1).reshape(1, L_patches, -1)
+        else:
+            pos_spatial = self.decoder_pos_embed_spatial
+
+        if T_patches != self.num_patches_temporal:
+            pos_temporal = self.decoder_pos_embed_temporal.permute(0, 2, 1)
+            pos_temporal = F.interpolate(pos_temporal, size=T_patches, mode='linear')
+            pos_temporal = pos_temporal.permute(0, 2, 1)
+        else:
+            pos_temporal = self.decoder_pos_embed_temporal
+
+        x = x + pos_spatial.unsqueeze(1)  # Add spatial pos embed
+        x = x + pos_temporal.unsqueeze(2)  # Add temporal pos embed
+
+        # Flatten back: (B, T, L, D) -> (B, T*L, D)
+        x = x.reshape(B, T_patches * L_patches, -1)
+
+        # Add cls token with its positional embedding
+        cls_token = cls_token + self.decoder_pos_embed_class
+        x = torch.cat([cls_token, x], dim=1)
+
+        # Apply decoder blocks
+        for blk in self.decoder_blocks:
+            x = blk(x)
+
+        x = self.decoder_norm(x)
+
+        # Remove cls token and predict pixels
+        x = x[:, 1:]  # (B, T*L, D)
+        x = self.decoder_pred(x)  # (B, T*L, t*p*p*c)
+
+        # Reshape to (B, T, L, t*p*p*c)
+        x = x.reshape(B, T_patches, L_patches, -1)
+
+        return x
+
+
+class OCTCubeMAE(nn.Module):
+    """
+    Complete OCTCube MAE model with encoder and decoder.
+
+    Use this for:
+    1. Computing per-patch reconstruction loss
+    2. Identifying unusual/pathological patches
+    3. Creating steering vectors
+    """
+
+    def __init__(
+        self,
+        img_size: int = 512,
+        patch_size: int = 16,
+        in_chans: int = 1,
+        num_frames: int = 48,
+        t_patch_size: int = 3,
+        size: str = 'large',
+        checkpoint_path: Optional[str] = None,
+    ):
+        super().__init__()
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.num_frames = num_frames
+        self.t_patch_size = t_patch_size
+
+        grid_size = img_size // patch_size
+        num_patches_spatial = grid_size * grid_size
+        num_patches_temporal = num_frames // t_patch_size
+
+        # Create encoder
+        self.encoder = OCTCubeWrapper(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            num_frames=num_frames,
+            t_patch_size=t_patch_size,
+            size=size,
+        )
+
+        # Create decoder
+        encoder_dim = 1024 if size == 'large' else 768
+        self.decoder = MAEDecoder(
+            encoder_embed_dim=encoder_dim,
+            decoder_embed_dim=512,
+            decoder_depth=8,
+            decoder_num_heads=16,
+            patch_size=patch_size,
+            t_patch_size=t_patch_size,
+            in_chans=in_chans,
+            num_patches_spatial=num_patches_spatial,
+            num_patches_temporal=num_patches_temporal,
+        )
+
+        # Load checkpoint if provided
+        if checkpoint_path is not None:
+            self.load_pretrained(checkpoint_path)
+
+    def load_pretrained(self, checkpoint_path: str):
+        """Load pretrained weights for both encoder and decoder."""
+        print(f"Loading MAE weights from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+
+        # Remap flash attention keys
+        state_dict = self.encoder._remap_flash_attention_keys(state_dict)
+
+        # Also remap decoder attention keys
+        state_dict = self._remap_decoder_keys(state_dict)
+
+        # Split state dict into encoder and decoder parts
+        encoder_state = {}
+        decoder_state = {}
+        other_keys = []
+
+        for key, value in state_dict.items():
+            if key.startswith('decoder_'):
+                # Remove 'decoder_' prefix for decoder module
+                new_key = key[8:]  # len('decoder_') = 8
+                # Handle decoder_blocks -> blocks
+                if new_key.startswith('blocks'):
+                    new_key = 'decoder_' + new_key
+                decoder_state[key] = value
+            elif key in ['mask_token']:
+                decoder_state[key] = value
+            else:
+                encoder_state[key] = value
+
+        # Load encoder weights
+        interpolate_pos_embed(self.encoder.model, encoder_state)
+        interpolate_temporal_pos_embed(
+            self.encoder.model, encoder_state,
+            self.num_frames, self.t_patch_size
+        )
+        enc_msg = self.encoder.model.load_state_dict(encoder_state, strict=False)
+        print(f"  Encoder - Missing: {len(enc_msg.missing_keys)}, Unexpected: {len(enc_msg.unexpected_keys)}")
+
+        # Load decoder weights
+        dec_msg = self.decoder.load_state_dict(decoder_state, strict=False)
+        print(f"  Decoder - Missing: {len(dec_msg.missing_keys)}, Unexpected: {len(dec_msg.unexpected_keys)}")
+        if dec_msg.missing_keys:
+            print(f"    Missing decoder keys: {dec_msg.missing_keys[:5]}")
+
+    def _remap_decoder_keys(self, state_dict: dict) -> dict:
+        """Remap decoder attention keys from flash attention naming."""
+        import re
+
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key
+
+            # Remap decoder block attention keys
+            if 'decoder_blocks' in key:
+                if '.mixer.Wqkv.' in key:
+                    new_key = re.sub(r'\.mixer\.Wqkv\.', '.attn.qkv.', key)
+                elif '.mixer.out_proj.' in key:
+                    new_key = re.sub(r'\.mixer\.out_proj\.', '.attn.proj.', key)
+
+            new_state_dict[new_key] = value
+
+        return new_state_dict
+
+    def forward(self, x):
+        """
+        Forward pass through encoder and decoder.
+
+        Args:
+            x: (B, T, C, H, W) input volume
+
+        Returns:
+            reconstructed: (B, T, L, t*p*p*c) reconstructed patch pixels
+            tokens: (B, T, L, D) encoder tokens
+        """
+        if x.dim() == 4:
+            x = x.unsqueeze(2)  # (B, T, H, W) -> (B, T, 1, H, W)
+
+        B, T, C, H, W = x.shape
+        T_patches = T // self.t_patch_size
+        L_patches = (H // self.patch_size) * (W // self.patch_size)
+
+        # Get encoder tokens
+        tokens = self.encoder(x, return_all_tokens=True)  # (B, T_patches, L, D)
+
+        # Flatten for decoder: (B, T, L, D) -> (B, T*L, D)
+        tokens_flat = rearrange(tokens, 'b t l d -> b (t l) d')
+
+        # Decode
+        reconstructed = self.decoder(tokens_flat, T_patches, L_patches)
+
+        return reconstructed, tokens
+
+    def patchify(self, x):
+        """
+        Convert image volume to patches.
+
+        Args:
+            x: (B, T, C, H, W) input volume
+
+        Returns:
+            patches: (B, T_patches, L_patches, t*p*p*c)
+        """
+        B, T, C, H, W = x.shape
+        p = self.patch_size
+        t = self.t_patch_size
+
+        # Reshape to extract patches
+        # (B, T, C, H, W) -> (B, T/t, t, C, H/p, p, W/p, p)
+        x = x.reshape(B, T // t, t, C, H // p, p, W // p, p)
+        # -> (B, T/t, H/p, W/p, t, p, p, C)
+        x = x.permute(0, 1, 4, 6, 2, 5, 7, 3)
+        # -> (B, T/t, H/p * W/p, t*p*p*c)
+        x = x.reshape(B, T // t, (H // p) * (W // p), t * p * p * C)
+
+        return x
+
+    def unpatchify(self, patches, T_out: int, H_out: int, W_out: int):
+        """
+        Convert patches back to image volume.
+
+        Args:
+            patches: (B, T_patches, L_patches, t*p*p*c)
+            T_out, H_out, W_out: output dimensions
+
+        Returns:
+            x: (B, T_out, C, H_out, W_out)
+        """
+        B, T_patches, L_patches, _ = patches.shape
+        p = self.patch_size
+        t = self.t_patch_size
+        C = self.in_chans
+        h = w = int(L_patches ** 0.5)
+
+        # (B, T/t, L, t*p*p*c) -> (B, T/t, h, w, t, p, p, c)
+        patches = patches.reshape(B, T_patches, h, w, t, p, p, C)
+        # -> (B, T/t, t, c, h, p, w, p)
+        patches = patches.permute(0, 1, 4, 7, 2, 5, 3, 6)
+        # -> (B, T, C, H, W)
+        x = patches.reshape(B, T_patches * t, C, h * p, w * p)
+
+        return x
+
+
+########################################################################
+# Per-Patch Analysis Tools
+
+
+class PatchAnalyzer:
+    """
+    Analyze per-patch reconstruction loss to identify unusual patches.
+
+    Usage:
+        analyzer = PatchAnalyzer(mae_model)
+        results = analyzer.analyze_volume(volume)
+        unusual_patches = analyzer.get_unusual_patches(results, threshold=2.0)
+    """
+
+    def __init__(self, mae_model: OCTCubeMAE):
+        self.mae = mae_model
+        self.mae.eval()
+
+        # Statistics for normalization (computed from dataset)
+        self.loss_mean = None
+        self.loss_std = None
+        self.loss_history = []
+
+    @torch.no_grad()
+    def compute_patch_losses(self, x: Tensor) -> dict:
+        """
+        Compute per-patch reconstruction loss.
+
+        Args:
+            x: (B, T, C, H, W) input volume
+
+        Returns:
+            dict with:
+                - patch_losses: (B, T_patches, L_patches) per-patch MSE
+                - reconstructed: (B, T, C, H, W) reconstructed volume
+                - tokens: (B, T_patches, L_patches, D) encoder tokens
+        """
+        if x.dim() == 4:
+            x = x.unsqueeze(2)
+
+        B, T, C, H, W = x.shape
+
+        # Get reconstruction
+        reconstructed_patches, tokens = self.mae(x)
+
+        # Get target patches
+        target_patches = self.mae.patchify(x)  # (B, T_patches, L_patches, t*p*p*c)
+
+        # Compute per-patch MSE loss
+        patch_losses = ((reconstructed_patches - target_patches) ** 2).mean(dim=-1)
+
+        # Unpatchify for visualization
+        reconstructed = self.mae.unpatchify(reconstructed_patches, T, H, W)
+
+        return {
+            'patch_losses': patch_losses,
+            'reconstructed': reconstructed,
+            'tokens': tokens,
+            'target_patches': target_patches,
+            'reconstructed_patches': reconstructed_patches,
+        }
+
+    def update_statistics(self, patch_losses: Tensor):
+        """Update running statistics of patch losses."""
+        flat_losses = patch_losses.flatten().cpu().numpy()
+        self.loss_history.extend(flat_losses.tolist())
+
+        if len(self.loss_history) > 100000:
+            # Keep only recent history to avoid memory issues
+            self.loss_history = self.loss_history[-100000:]
+
+        self.loss_mean = np.mean(self.loss_history)
+        self.loss_std = np.std(self.loss_history)
+
+    def get_unusual_patches(
+        self,
+        patch_losses: Tensor,
+        threshold_std: float = 2.0,
+        min_loss: Optional[float] = None,
+    ) -> Tensor:
+        """
+        Identify patches with unusually high reconstruction loss.
+
+        Args:
+            patch_losses: (B, T_patches, L_patches) per-patch losses
+            threshold_std: number of standard deviations above mean to consider unusual
+            min_loss: optional minimum absolute loss threshold
+
+        Returns:
+            unusual_mask: (B, T_patches, L_patches) boolean mask of unusual patches
+        """
+        if self.loss_mean is None:
+            # Use batch statistics if no history
+            mean = patch_losses.mean()
+            std = patch_losses.std()
+        else:
+            mean = self.loss_mean
+            std = self.loss_std
+
+        threshold = mean + threshold_std * std
+
+        if min_loss is not None:
+            threshold = max(threshold, min_loss)
+
+        unusual_mask = patch_losses > threshold
+
+        return unusual_mask
+
+    def get_patch_statistics(self, patch_losses: Tensor) -> dict:
+        """Get statistics about patch losses."""
+        return {
+            'mean': patch_losses.mean().item(),
+            'std': patch_losses.std().item(),
+            'min': patch_losses.min().item(),
+            'max': patch_losses.max().item(),
+            'median': patch_losses.median().item(),
+            'percentile_90': torch.quantile(patch_losses.flatten(), 0.9).item(),
+            'percentile_95': torch.quantile(patch_losses.flatten(), 0.95).item(),
+            'percentile_99': torch.quantile(patch_losses.flatten(), 0.99).item(),
+        }
+
+
+########################################################################
+# Steering Vector Extraction
+
+
+class SteeringVectorExtractor:
+    """
+    Extract steering vectors from encoder activations.
+
+    Steering vectors represent the direction in activation space
+    between unusual/pathological patches and normal patches.
+
+    Usage:
+        extractor = SteeringVectorExtractor(mae_model)
+
+        # Collect samples
+        for volume in dataset:
+            extractor.collect_samples(volume)
+
+        # Compute steering vector
+        steering_vector = extractor.compute_steering_vector()
+
+        # Apply steering to modify representations
+        modified_tokens = extractor.apply_steering(tokens, strength=1.0)
+    """
+
+    def __init__(
+        self,
+        mae_model: OCTCubeMAE,
+        analyzer: Optional[PatchAnalyzer] = None,
+    ):
+        self.mae = mae_model
+        self.analyzer = analyzer or PatchAnalyzer(mae_model)
+
+        # Collected activations
+        self.unusual_activations = []
+        self.normal_activations = []
+
+        # Computed steering vector
+        self.steering_vector = None
+
+    @torch.no_grad()
+    def collect_samples(
+        self,
+        x: Tensor,
+        unusual_threshold_std: float = 2.0,
+        max_samples_per_volume: int = 100,
+    ):
+        """
+        Collect activation samples from a volume.
+
+        Args:
+            x: (B, T, C, H, W) input volume
+            unusual_threshold_std: std threshold for unusual patches
+            max_samples_per_volume: max samples to collect per call
+        """
+        # Analyze patches
+        results = self.analyzer.compute_patch_losses(x)
+        patch_losses = results['patch_losses']
+        tokens = results['tokens']  # (B, T_patches, L_patches, D)
+
+        # Update statistics
+        self.analyzer.update_statistics(patch_losses)
+
+        # Get unusual mask
+        unusual_mask = self.analyzer.get_unusual_patches(
+            patch_losses, threshold_std=unusual_threshold_std
+        )
+        normal_mask = ~unusual_mask
+
+        # Flatten for indexing
+        B, T, L, D = tokens.shape
+        tokens_flat = tokens.reshape(-1, D)  # (B*T*L, D)
+        unusual_flat = unusual_mask.reshape(-1)
+        normal_flat = normal_mask.reshape(-1)
+
+        # Collect unusual activations
+        unusual_indices = unusual_flat.nonzero(as_tuple=True)[0]
+        if len(unusual_indices) > 0:
+            # Randomly sample if too many
+            if len(unusual_indices) > max_samples_per_volume:
+                perm = torch.randperm(len(unusual_indices))[:max_samples_per_volume]
+                unusual_indices = unusual_indices[perm]
+
+            unusual_tokens = tokens_flat[unusual_indices].cpu()
+            self.unusual_activations.append(unusual_tokens)
+
+        # Collect normal activations (sample same number as unusual)
+        normal_indices = normal_flat.nonzero(as_tuple=True)[0]
+        if len(normal_indices) > 0:
+            num_to_sample = min(len(unusual_indices) if len(unusual_indices) > 0 else max_samples_per_volume,
+                               len(normal_indices))
+            perm = torch.randperm(len(normal_indices))[:num_to_sample]
+            normal_indices = normal_indices[perm]
+
+            normal_tokens = tokens_flat[normal_indices].cpu()
+            self.normal_activations.append(normal_tokens)
+
+    def compute_steering_vector(self, normalize: bool = True) -> Tensor:
+        """
+        Compute steering vector from collected samples.
+
+        The steering vector is the difference between mean unusual
+        and mean normal activations.
+
+        Args:
+            normalize: whether to normalize the steering vector
+
+        Returns:
+            steering_vector: (D,) tensor
+        """
+        if len(self.unusual_activations) == 0:
+            raise ValueError("No unusual activations collected. Run collect_samples first.")
+        if len(self.normal_activations) == 0:
+            raise ValueError("No normal activations collected. Run collect_samples first.")
+
+        # Concatenate all samples
+        unusual = torch.cat(self.unusual_activations, dim=0)  # (N_unusual, D)
+        normal = torch.cat(self.normal_activations, dim=0)    # (N_normal, D)
+
+        print(f"Computing steering vector from {len(unusual)} unusual and {len(normal)} normal samples")
+
+        # Compute means
+        unusual_mean = unusual.mean(dim=0)
+        normal_mean = normal.mean(dim=0)
+
+        # Steering vector: direction from normal to unusual
+        steering = unusual_mean - normal_mean
+
+        if normalize:
+            steering = steering / steering.norm()
+
+        self.steering_vector = steering
+        return steering
+
+    def apply_steering(
+        self,
+        tokens: Tensor,
+        strength: float = 1.0,
+        direction: str = 'towards_normal',
+    ) -> Tensor:
+        """
+        Apply steering vector to tokens.
+
+        Args:
+            tokens: (B, T, L, D) or (B, N, D) encoder tokens
+            strength: how much to steer (multiplier for steering vector)
+            direction: 'towards_normal' (subtract) or 'towards_unusual' (add)
+
+        Returns:
+            steered_tokens: same shape as input
+        """
+        if self.steering_vector is None:
+            raise ValueError("No steering vector computed. Run compute_steering_vector first.")
+
+        steering = self.steering_vector.to(tokens.device)
+
+        if direction == 'towards_normal':
+            # Move away from unusual, towards normal
+            return tokens - strength * steering
+        elif direction == 'towards_unusual':
+            # Move towards unusual (amplify pathological features)
+            return tokens + strength * steering
+        else:
+            raise ValueError(f"Unknown direction: {direction}")
+
+    def get_projection_scores(self, tokens: Tensor) -> Tensor:
+        """
+        Project tokens onto steering vector to get "unusualness" score.
+
+        Args:
+            tokens: (B, T, L, D) or (B, N, D) encoder tokens
+
+        Returns:
+            scores: same shape as tokens but without D dimension
+        """
+        if self.steering_vector is None:
+            raise ValueError("No steering vector computed. Run compute_steering_vector first.")
+
+        steering = self.steering_vector.to(tokens.device)
+
+        # Dot product with steering vector
+        scores = (tokens * steering).sum(dim=-1)
+
+        return scores
+
+    def save(self, path: str):
+        """Save steering vector and statistics."""
+        torch.save({
+            'steering_vector': self.steering_vector,
+            'loss_mean': self.analyzer.loss_mean,
+            'loss_std': self.analyzer.loss_std,
+            'num_unusual_samples': sum(len(u) for u in self.unusual_activations),
+            'num_normal_samples': sum(len(n) for n in self.normal_activations),
+        }, path)
+        print(f"Saved steering vector to {path}")
+
+    def load(self, path: str):
+        """Load steering vector and statistics."""
+        data = torch.load(path, map_location='cpu', weights_only=False)
+        self.steering_vector = data['steering_vector']
+        self.analyzer.loss_mean = data['loss_mean']
+        self.analyzer.loss_std = data['loss_std']
+        print(f"Loaded steering vector from {path}")
+        print(f"  Based on {data['num_unusual_samples']} unusual and {data['num_normal_samples']} normal samples")
+
+
+########################################################################
 # ConvNeXt-based Segmentation Head
 
 
