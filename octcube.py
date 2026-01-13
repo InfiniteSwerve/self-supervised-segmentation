@@ -596,7 +596,7 @@ class OCTCubeWrapper(nn.Module):
         return self.model(x, return_all_tokens=return_all_tokens)
 
     def load_pretrained(self, checkpoint_path: str, strict: bool = False):
-        """Load pretrained weights with position embedding interpolation."""
+        """Load pretrained weights with position embedding interpolation and key remapping."""
         print(f"Loading pretrained weights from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
@@ -604,6 +604,11 @@ class OCTCubeWrapper(nn.Module):
             state_dict = checkpoint['model']
         else:
             state_dict = checkpoint
+
+        # Remap flash attention keys to standard attention naming
+        # OCTCube checkpoint uses: blocks.{i}.mixer.Wqkv -> our blocks.{i}.attn.qkv
+        #                         blocks.{i}.mixer.out_proj -> our blocks.{i}.attn.proj
+        state_dict = self._remap_flash_attention_keys(state_dict)
 
         # Interpolate position embeddings if needed
         interpolate_pos_embed(self.model, state_dict)
@@ -626,6 +631,40 @@ class OCTCubeWrapper(nn.Module):
             print(f"  Decoder keys in checkpoint: {len(decoder_keys)}")
 
         return msg
+
+    def _remap_flash_attention_keys(self, state_dict: dict) -> dict:
+        """
+        Remap OCTCube flash attention keys to standard attention naming.
+
+        OCTCube checkpoint uses:
+            blocks.{i}.mixer.Wqkv.weight -> blocks.{i}.attn.qkv.weight
+            blocks.{i}.mixer.Wqkv.bias -> blocks.{i}.attn.qkv.bias
+            blocks.{i}.mixer.out_proj.weight -> blocks.{i}.attn.proj.weight
+            blocks.{i}.mixer.out_proj.bias -> blocks.{i}.attn.proj.bias
+        """
+        import re
+
+        new_state_dict = {}
+        remapped_count = 0
+
+        for key, value in state_dict.items():
+            new_key = key
+
+            # Remap mixer.Wqkv -> attn.qkv
+            if '.mixer.Wqkv.' in key:
+                new_key = re.sub(r'\.mixer\.Wqkv\.', '.attn.qkv.', key)
+                remapped_count += 1
+            # Remap mixer.out_proj -> attn.proj
+            elif '.mixer.out_proj.' in key:
+                new_key = re.sub(r'\.mixer\.out_proj\.', '.attn.proj.', key)
+                remapped_count += 1
+
+            new_state_dict[new_key] = value
+
+        if remapped_count > 0:
+            print(f"  Remapped {remapped_count} flash attention keys to standard naming")
+
+        return new_state_dict
 
     @property
     def device(self):
