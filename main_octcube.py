@@ -27,6 +27,204 @@ from octcube import OCTCubeSegmenter
 typechecked = jaxtyped(typechecker=beartype)
 
 
+########################################################################
+# Per-Volume Loss Tracking
+
+
+class VolumeTracker:
+    """
+    Track per-volume training metrics to identify difficult volumes.
+
+    Usage:
+        tracker = VolumeTracker()
+
+        # During training
+        tracker.record(volume_id, {"loss": 0.5, "dice_mean": 0.8})
+
+        # Get difficult volumes
+        difficult = tracker.get_difficult_volumes(metric="loss", top_k=10)
+
+        # Save report
+        tracker.save_report("volume_report.json")
+    """
+
+    def __init__(self):
+        from collections import defaultdict
+        self.volume_metrics = defaultdict(lambda: {"losses": [], "dice_scores": [], "count": 0})
+        self.epoch_metrics = defaultdict(lambda: defaultdict(list))  # epoch -> volume_id -> metrics
+
+    def record(self, volume_id: str, metrics: dict, epoch: int = 0):
+        """Record metrics for a volume."""
+        self.volume_metrics[volume_id]["count"] += 1
+
+        if "loss" in metrics:
+            self.volume_metrics[volume_id]["losses"].append(metrics["loss"])
+            self.epoch_metrics[epoch][volume_id].append(("loss", metrics["loss"]))
+
+        if "dice_mean" in metrics:
+            self.volume_metrics[volume_id]["dice_scores"].append(metrics["dice_mean"])
+            self.epoch_metrics[epoch][volume_id].append(("dice_mean", metrics["dice_mean"]))
+
+    def get_volume_summary(self, volume_id: str) -> dict:
+        """Get summary statistics for a volume."""
+        data = self.volume_metrics[volume_id]
+        if not data["losses"]:
+            return {}
+
+        losses = np.array(data["losses"])
+        dice_scores = np.array(data["dice_scores"]) if data["dice_scores"] else np.array([])
+
+        summary = {
+            "volume_id": volume_id,
+            "num_steps": data["count"],
+            "loss_mean": float(losses.mean()),
+            "loss_std": float(losses.std()),
+            "loss_max": float(losses.max()),
+            "loss_min": float(losses.min()),
+            "loss_latest": float(losses[-1]),
+        }
+
+        if len(dice_scores) > 0:
+            summary.update({
+                "dice_mean": float(dice_scores.mean()),
+                "dice_std": float(dice_scores.std()),
+                "dice_min": float(dice_scores.min()),
+                "dice_max": float(dice_scores.max()),
+                "dice_latest": float(dice_scores[-1]),
+            })
+
+        return summary
+
+    def get_all_summaries(self) -> list:
+        """Get summaries for all volumes."""
+        return [self.get_volume_summary(vid) for vid in self.volume_metrics.keys()]
+
+    def get_difficult_volumes(
+        self,
+        metric: str = "loss",
+        top_k: int = 10,
+        use_latest: bool = False,
+    ) -> list:
+        """
+        Get the most difficult volumes based on a metric.
+
+        Args:
+            metric: "loss" (higher = harder) or "dice" (lower = harder)
+            top_k: number of volumes to return
+            use_latest: if True, use latest value; if False, use mean
+
+        Returns:
+            List of (volume_id, metric_value) tuples, sorted by difficulty
+        """
+        summaries = self.get_all_summaries()
+
+        if metric == "loss":
+            key = "loss_latest" if use_latest else "loss_mean"
+            # Higher loss = harder
+            summaries = sorted(summaries, key=lambda x: x.get(key, 0), reverse=True)
+        elif metric == "dice":
+            key = "dice_latest" if use_latest else "dice_mean"
+            # Lower dice = harder
+            summaries = sorted(summaries, key=lambda x: x.get(key, 1), reverse=False)
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+
+        return [(s["volume_id"], s.get(key, None)) for s in summaries[:top_k]]
+
+    def get_improving_volumes(self, min_steps: int = 5) -> list:
+        """Get volumes that are improving (loss decreasing over time)."""
+        improving = []
+        for vid, data in self.volume_metrics.items():
+            if len(data["losses"]) >= min_steps:
+                losses = np.array(data["losses"])
+                # Simple linear regression to check trend
+                x = np.arange(len(losses))
+                slope = np.polyfit(x, losses, 1)[0]
+                if slope < 0:  # Negative slope = improving
+                    improving.append((vid, slope, losses[-1]))
+
+        return sorted(improving, key=lambda x: x[1])  # Most improving first
+
+    def get_stuck_volumes(self, min_steps: int = 5, threshold: float = 0.01) -> list:
+        """Get volumes that are stuck (not improving)."""
+        stuck = []
+        for vid, data in self.volume_metrics.items():
+            if len(data["losses"]) >= min_steps:
+                losses = np.array(data["losses"])
+                # Check if loss variance is low (stuck)
+                recent_losses = losses[-min_steps:]
+                if recent_losses.std() < threshold:
+                    stuck.append((vid, recent_losses.mean(), recent_losses.std()))
+
+        return sorted(stuck, key=lambda x: x[1], reverse=True)  # Highest loss first
+
+    def print_report(self, top_k: int = 10):
+        """Print a summary report."""
+        print("\n" + "=" * 60)
+        print("VOLUME DIFFICULTY REPORT")
+        print("=" * 60)
+
+        print(f"\nTotal volumes tracked: {len(self.volume_metrics)}")
+
+        print(f"\n--- Top {top_k} Hardest Volumes (by mean loss) ---")
+        for vid, val in self.get_difficult_volumes("loss", top_k):
+            summary = self.get_volume_summary(vid)
+            dice_str = f", dice={summary.get('dice_mean', 'N/A'):.3f}" if 'dice_mean' in summary else ""
+            print(f"  {vid}: loss={val:.4f}{dice_str} ({summary['num_steps']} steps)")
+
+        if any("dice_mean" in self.get_volume_summary(vid) for vid in self.volume_metrics):
+            print(f"\n--- Top {top_k} Hardest Volumes (by mean dice) ---")
+            for vid, val in self.get_difficult_volumes("dice", top_k):
+                summary = self.get_volume_summary(vid)
+                print(f"  {vid}: dice={val:.4f}, loss={summary['loss_mean']:.4f}")
+
+        stuck = self.get_stuck_volumes()
+        if stuck:
+            print(f"\n--- Stuck Volumes (not improving) ---")
+            for vid, mean_loss, std in stuck[:top_k]:
+                print(f"  {vid}: loss={mean_loss:.4f} (std={std:.4f})")
+
+        print("=" * 60 + "\n")
+
+    def save_report(self, path: str):
+        """Save detailed report to JSON."""
+        import json
+
+        report = {
+            "total_volumes": len(self.volume_metrics),
+            "summaries": self.get_all_summaries(),
+            "difficult_by_loss": self.get_difficult_volumes("loss", top_k=50),
+            "difficult_by_dice": self.get_difficult_volumes("dice", top_k=50),
+            "stuck_volumes": self.get_stuck_volumes(),
+            "improving_volumes": self.get_improving_volumes(),
+        }
+
+        with open(path, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"Saved volume report to {path}")
+
+    def save(self, path: str):
+        """Save tracker state."""
+        import json
+        with open(path, "w") as f:
+            json.dump({
+                "volume_metrics": {k: dict(v) for k, v in self.volume_metrics.items()},
+            }, f)
+
+    def load(self, path: str):
+        """Load tracker state."""
+        import json
+        from collections import defaultdict
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                data = json.load(f)
+            self.volume_metrics = defaultdict(
+                lambda: {"losses": [], "dice_scores": [], "count": 0},
+                {k: v for k, v in data["volume_metrics"].items()}
+            )
+            print(f"Loaded volume tracker from {path} ({len(self.volume_metrics)} volumes)")
+
+
 @dataclass
 class TrainConfig:
     # Training parameters
@@ -36,6 +234,7 @@ class TrainConfig:
     plot_losses: int = 300
     epochs: int = 20
     dice_calc_interval: int = 50
+    volume_report_interval: int = 500  # Print volume difficulty report every N iterations
 
     # Model parameters
     img_size: int = 512
@@ -158,6 +357,9 @@ class Metrics:
     def should_calc_dice(self):
         return self.current_iter % TrainConfig.dice_calc_interval == 0
 
+    def should_print_volume_report(self):
+        return self.current_iter % TrainConfig.volume_report_interval == 0
+
     def get_latest_val_dice(self) -> Optional[float]:
         """Get the most recent validation dice_mean score."""
         dice_vals = self.data["val"]["metrics"].get("dice_mean", [])
@@ -276,12 +478,20 @@ def supervised_epoch(
     train_dataloader,
     val_dataloader,
     metrics: Metrics,
+    volume_tracker: Optional[VolumeTracker] = None,
 ):
     """Training epoch - processes volumes in chunks."""
     model.train()
 
-    for batch in train_dataloader:
+    for batch_idx, batch in enumerate(train_dataloader):
         st = time.monotonic()
+
+        # Get volume identifier (use path if available, else batch index)
+        volume_id = batch.get("path", [f"vol_{batch_idx}"])[0] if isinstance(batch, dict) else f"vol_{batch_idx}"
+        if isinstance(volume_id, (list, tuple)):
+            volume_id = volume_id[0]
+        # Extract just the filename for cleaner display
+        volume_id = os.path.basename(str(volume_id)) if "/" in str(volume_id) else str(volume_id)
 
         # Load volume data
         # frames: (C, S, H, W) -> (S, C, H, W)
@@ -290,7 +500,11 @@ def supervised_epoch(
         height = batch["label"][0].permute(1, 0, 2).cuda()
 
         S, C, H, W = ims.shape
-        print(f"Volume loaded: {S} slices, {H}x{W}, time: {time.monotonic() - st:.2f}s")
+        print(f"Volume [{volume_id}] loaded: {S} slices, {H}x{W}, time: {time.monotonic() - st:.2f}s")
+
+        # Accumulate metrics for this volume
+        volume_losses = []
+        volume_dice_scores = []
 
         # Process in chunks of step_size slices
         for run in range(0, S, TrainConfig.step_size):
@@ -317,24 +531,37 @@ def supervised_epoch(
                 chunk_height = height[run:end_idx]
 
             st = time.monotonic()
-            metrics.append(
-                "train",
-                one_supervised_step(
-                    model,
-                    optimizer,
-                    scaler,
-                    chunk_ims,
-                    chunk_height,
-                    metrics,
-                ),
+            step_metrics = one_supervised_step(
+                model,
+                optimizer,
+                scaler,
+                chunk_ims,
+                chunk_height,
+                metrics,
             )
+            metrics.append("train", step_metrics)
+
+            # Track per-volume metrics
+            volume_losses.append(step_metrics["loss"])
+            if "dice_mean" in step_metrics:
+                volume_dice_scores.append(step_metrics["dice_mean"])
 
             if metrics.should_run_validation_partial_epoch():
                 validation_partial_epoch(model, val_dataloader, metrics, "val_partial")
             if metrics.should_plot_losses():
                 metrics.plot_metrics()
+            if metrics.should_print_volume_report() and volume_tracker is not None:
+                volume_tracker.print_report(top_k=10)
 
             print(f"Step time: {time.monotonic() - st:.2f}s")
+
+        # Record aggregated volume metrics
+        if volume_tracker is not None:
+            vol_metrics = {"loss": np.mean(volume_losses)}
+            if volume_dice_scores:
+                vol_metrics["dice_mean"] = np.mean(volume_dice_scores)
+            volume_tracker.record(volume_id, vol_metrics, epoch=metrics.current_epoch)
+            print(f"  Volume [{volume_id}] avg loss: {vol_metrics['loss']:.4f}")
 
 
 @typechecked
@@ -619,6 +846,11 @@ def full_supervised_run():
     metrics = Metrics()
     print("Initialized Metrics")
 
+    # Initialize volume tracker
+    volume_tracker = VolumeTracker()
+    volume_tracker_path = os.path.join(TrainConfig.save_dir, "volume_tracker.json")
+    print("Initialized Volume Tracker")
+
     # Track best validation performance
     best_val_dice = 0.0
 
@@ -633,6 +865,9 @@ def full_supervised_run():
                 best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
                 best_val_dice = best_ckpt["metrics"]["data"]["val"]["metrics"].get("dice_mean", [0])[-1]
                 print(f"Best validation dice so far: {best_val_dice:.4f}")
+            # Load volume tracker if it exists
+            if os.path.exists(volume_tracker_path):
+                volume_tracker.load(volume_tracker_path)
 
     latest_path = os.path.join(TrainConfig.save_dir, "latest.pt")
     best_path = os.path.join(TrainConfig.save_dir, "best.pt")
@@ -647,6 +882,7 @@ def full_supervised_run():
             train_loader,
             val_loader,
             metrics,
+            volume_tracker=volume_tracker,
         )
 
         print("validation")
@@ -658,17 +894,25 @@ def full_supervised_run():
         # Save latest checkpoint
         save_checkpoint(model, optimizer, scaler, metrics, latest_path)
 
+        # Save volume tracker
+        volume_tracker.save(volume_tracker_path)
+
         # Save best checkpoint if this is the best so far
         if current_val_dice is not None and current_val_dice > best_val_dice:
             best_val_dice = current_val_dice
             save_checkpoint(model, optimizer, scaler, metrics, best_path, is_best=True)
             print(f"New best validation dice: {best_val_dice:.4f}")
 
+        # Print volume report at end of each epoch
+        volume_tracker.print_report(top_k=10)
+
     print("testing")
     validation_epoch(model, test_loader, metrics, "test")
 
-    # Save final metrics
+    # Save final metrics and volume report
     metrics.save(os.path.join(TrainConfig.save_dir, "metrics_final.json"))
+    volume_tracker.save_report(os.path.join(TrainConfig.save_dir, "volume_difficulty_report.json"))
+    volume_tracker.print_report(top_k=20)
 
 
 if __name__ == "__main__":
