@@ -616,6 +616,15 @@ class OCTCubeWrapper(nn.Module):
         print(f"  # Missing keys: {len(msg.missing_keys)}")
         print(f"  # Unexpected keys: {len(msg.unexpected_keys)}")
 
+        # Print some examples to help debug
+        if msg.missing_keys:
+            print(f"  Missing keys (first 10): {msg.missing_keys[:10]}")
+        if msg.unexpected_keys:
+            print(f"  Unexpected keys (first 10): {msg.unexpected_keys[:10]}")
+            # Check if decoder keys are present (MAE decoder)
+            decoder_keys = [k for k in msg.unexpected_keys if 'decoder' in k.lower()]
+            print(f"  Decoder keys in checkpoint: {len(decoder_keys)}")
+
         return msg
 
     @property
