@@ -39,7 +39,7 @@ class MAETrainConfig:
     lr: float = 1e-4
     weight_decay: float = 0.05
     batch_size: int = 1  # Per-volume, processed in chunks
-    mask_ratio: float = 0.0  # 0.0 = reconstruct all patches (autoencoder), 0.75 = standard MAE
+    mask_ratio: float = 0.75  # Standard MAE: mask 75%, reconstruct from 25%
 
     # Checkpointing
     save_dir: str = "checkpoints_mae"
@@ -49,6 +49,15 @@ class MAETrainConfig:
     # Paths
     pretrained_checkpoint: Optional[str] = None  # Start from pretrained OCTCube
     resume_from: Optional[str] = None  # Resume training
+
+
+# NOTE: For anomaly detection, you probably don't need to train at all!
+# The pretrained OCTCube MAE already learned what "normal" OCT looks like.
+# Just use analyze_mae.py directly with the pretrained checkpoint.
+#
+# Only fine-tune if:
+# 1. Your OCT data is very different from OCTCube's training data
+# 2. You want the model to better capture your specific "normal" distribution
 
 
 class MAETrainer:
