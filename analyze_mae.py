@@ -178,6 +178,63 @@ def visualize_top_patches(
     plt.close()
 
 
+def visualize_full_slices(
+    images: torch.Tensor,  # (S, C, H, W)
+    reconstructed: torch.Tensor,  # (S, C, H, W)
+    patch_losses: torch.Tensor,  # (T_patches, H_patches, W_patches)
+    volume_id: str,
+    output_path: str,
+    config: AnalysisConfig,
+    num_slices: int = 6,
+):
+    """Show full slice side-by-side: original, reconstructed, difference, loss heatmap."""
+    S = images.shape[0]
+    t = config.t_patch_size
+    p = config.patch_size
+
+    # Sample slices evenly throughout volume
+    slice_indices = np.linspace(0, S - 1, num_slices, dtype=int)
+
+    fig, axes = plt.subplots(num_slices, 4, figsize=(16, 3.5 * num_slices))
+
+    for i, slice_idx in enumerate(slice_indices):
+        orig = images[slice_idx, 0].numpy()
+        recon = reconstructed[slice_idx, 0].numpy()
+        diff = np.abs(orig - recon)
+
+        # Get per-patch loss for this slice's temporal patch
+        t_patch_idx = min(slice_idx // t, patch_losses.shape[0] - 1)
+        loss_map = patch_losses[t_patch_idx].numpy()
+
+        # Original
+        axes[i, 0].imshow(orig, cmap='gray')
+        axes[i, 0].set_title("Original" if i == 0 else "")
+        axes[i, 0].set_ylabel(f"Slice {slice_idx}", fontsize=10)
+        axes[i, 0].axis('off')
+
+        # Reconstructed
+        axes[i, 1].imshow(recon, cmap='gray')
+        axes[i, 1].set_title("Reconstructed" if i == 0 else "")
+        axes[i, 1].axis('off')
+
+        # Pixel difference
+        im = axes[i, 2].imshow(diff, cmap='hot', vmin=0, vmax=diff.max())
+        axes[i, 2].set_title("Pixel Difference" if i == 0 else "")
+        axes[i, 2].axis('off')
+
+        # Patch loss heatmap (upscale to image size for overlay)
+        loss_upscaled = np.kron(loss_map, np.ones((p, p)))
+        axes[i, 3].imshow(orig, cmap='gray', alpha=0.5)
+        im_loss = axes[i, 3].imshow(loss_upscaled, cmap='hot', alpha=0.5, vmin=0, vmax=patch_losses.max())
+        axes[i, 3].set_title("Patch Loss Overlay" if i == 0 else "")
+        axes[i, 3].axis('off')
+
+    plt.suptitle(f"Reconstruction Quality - {volume_id}", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
 def run_analysis(config: AnalysisConfig):
     """Run anomaly analysis on dataset."""
     os.makedirs(config.output_dir, exist_ok=True)
@@ -246,11 +303,18 @@ def run_analysis(config: AnalysisConfig):
         for loss, t, h, w in top_patches:
             all_top_patches.append((loss, volume_id, t, h, w))
 
-        # Visualize
+        # Visualize anomalous patches
         output_path = os.path.join(config.output_dir, f"{volume_id}_anomalies.png")
         visualize_top_patches(
             images.cpu(), reconstructed, top_patches,
             volume_id, output_path, config
+        )
+
+        # Full slice side-by-side comparison
+        recon_path = os.path.join(config.output_dir, f"{volume_id}_reconstruction.png")
+        visualize_full_slices(
+            images.cpu(), reconstructed, patch_losses,
+            volume_id, recon_path, config
         )
 
     # Global summary
