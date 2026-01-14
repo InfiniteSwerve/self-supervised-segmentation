@@ -47,8 +47,8 @@ class MAETrainConfig:
     log_interval: int = 10  # Log every N steps
 
     # Paths
-    pretrained_checkpoint: Optional[str] = None  # Start from pretrained OCTCube
-    resume_from: Optional[str] = None  # Resume training
+    pretrained_checkpoint: Optional[str] = None  # OCTCube checkpoint (contains both encoder + decoder)
+    resume_from: Optional[str] = None  # Resume training from a train_mae checkpoint
 
 
 # NOTE: For anomaly detection, you probably don't need to train at all!

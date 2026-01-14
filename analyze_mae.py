@@ -31,7 +31,7 @@ class AnalysisConfig:
     model_size: str = 'large'
 
     # Paths
-    mae_checkpoint: str = "path/to/octcube_checkpoint.pth"
+    mae_checkpoint: str = "path/to/octcube_checkpoint.pth"  # OCTCube checkpoint (contains both encoder + decoder)
     output_dir: str = "mae_analysis"
 
     # Analysis settings
