@@ -938,6 +938,10 @@ class OCTCubeMAE(nn.Module):
         enc_msg = self.encoder.model.load_state_dict(encoder_state, strict=False)
         print(f"  Encoder - Missing: {len(enc_msg.missing_keys)}, Unexpected: {len(enc_msg.unexpected_keys)}")
 
+        # Interpolate decoder temporal pos embed if needed
+        target_T_patches = self.num_frames // self.t_patch_size
+        decoder_state = self._interpolate_decoder_pos_embeds(decoder_state, target_T_patches)
+
         # Load decoder weights
         dec_msg = self.decoder.load_state_dict(decoder_state, strict=False)
         print(f"  Decoder - Missing: {len(dec_msg.missing_keys)}, Unexpected: {len(dec_msg.unexpected_keys)}")
@@ -962,6 +966,24 @@ class OCTCubeMAE(nn.Module):
             new_state_dict[new_key] = value
 
         return new_state_dict
+
+    def _interpolate_decoder_pos_embeds(self, state_dict: dict, target_T_patches: int) -> dict:
+        """Interpolate decoder positional embeddings if temporal dimension doesn't match."""
+        key = 'decoder_pos_embed_temporal'
+        if key in state_dict:
+            pos_embed = state_dict[key]  # (1, T_src, D)
+            T_src = pos_embed.shape[1]
+
+            if T_src != target_T_patches:
+                print(f"  Interpolating {key}: {T_src} -> {target_T_patches} temporal patches")
+                # (1, T, D) -> (1, D, T) for interpolation
+                pos_embed = pos_embed.permute(0, 2, 1)
+                pos_embed = F.interpolate(pos_embed, size=target_T_patches, mode='linear', align_corners=False)
+                # (1, D, T) -> (1, T, D)
+                pos_embed = pos_embed.permute(0, 2, 1)
+                state_dict[key] = pos_embed
+
+        return state_dict
 
     def forward(self, x):
         """
