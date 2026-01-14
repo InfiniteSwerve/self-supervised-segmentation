@@ -223,6 +223,21 @@ def run_inference(config: InferenceConfig):
         S, C, H, W = ims.shape
         print(f"  Volume shape: {S} slices, {H}x{W}")
 
+        # Resize labels to match image dimensions if needed
+        # Labels may be at original resolution while images are resized to img_size
+        orig_W = height.shape[-1]
+        if orig_W != W:
+            # Assume original aspect ratio was preserved, so scale factors are equal
+            scale = W / orig_W
+            height = height * scale  # Scale boundary y-positions
+
+            # Resize width dimension using nearest neighbor
+            height = F.interpolate(
+                height.unsqueeze(1),  # (S, 1, L, W_orig)
+                size=(height.shape[1], W),
+                mode='nearest'
+            ).squeeze(1)  # (S, L, W)
+
         # Process in chunks
         all_preds = []
         all_gts = []
